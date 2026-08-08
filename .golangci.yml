@@ -8,3 +8,9 @@ linters:
       # Checking it everywhere would add noise without adding safety.
       - linters: [errcheck]
         source: "^\\s*defer "
+
+issues:
+  # Report every occurrence. The defaults truncate repeated messages, which
+  # makes a partially fixed file look finished.
+  max-same-issues: 0
+  max-issues-per-linter: 0
