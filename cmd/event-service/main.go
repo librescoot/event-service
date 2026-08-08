@@ -32,6 +32,7 @@ func main() {
 	client, err := ipc.New(
 		ipc.WithURL(*redisAddr),
 		ipc.WithDialTimeout(2*time.Second),
+		ipc.WithCodec(ipc.StringCodec{}),
 		ipc.WithOnConnect(func() { log.Printf("datastore connected") }),
 		ipc.WithOnDisconnect(func(err error) { log.Printf("datastore disconnected: %v", err) }),
 	)

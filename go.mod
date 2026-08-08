@@ -2,7 +2,10 @@ module github.com/librescoot/event-service
 
 go 1.25.7
 
-require github.com/librescoot/redis-ipc v0.15.2
+require (
+	github.com/librescoot/eventbus v0.0.0-00010101000000-000000000000
+	github.com/librescoot/redis-ipc v0.15.2
+)
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
