@@ -3,6 +3,7 @@ package adapter
 import (
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/librescoot/event-service/internal/shadow"
 	"github.com/librescoot/eventbus"
@@ -23,12 +24,20 @@ type Adapter struct {
 	sources  []Source
 	watchers []*ipc.HashWatcher
 	subs     []*ipc.Subscription[string]
+
+	// seeding marks, per hash, whether the initial HGETALL replay done by
+	// StartWithSync is still in flight. It has to be per-hash rather than
+	// one flag for the whole adapter: watchers start one at a time, and a
+	// single flag would suppress live events on an already-started hash
+	// while a later hash in the loop is still replaying.
+	seedingMu sync.Mutex
+	seeding   map[string]bool
 }
 
 // New returns an Adapter. client and emitter may be nil in tests that only
 // exercise Subscriptions.
 func New(client *ipc.Client, em Emitter, sh *shadow.Store) *Adapter {
-	return &Adapter{client: client, emitter: em, shadow: sh}
+	return &Adapter{client: client, emitter: em, shadow: sh, seeding: make(map[string]bool)}
 }
 
 // Register adds a source. Call before Start.
@@ -57,11 +66,17 @@ func (a *Adapter) Subscriptions() []string {
 	return out
 }
 
-// Start seeds the shadow store, then subscribes.
+// Start subscribes to every hash and channel the registered sources need.
 //
-// Seeding first means the first notification after startup produces a correct
-// "from" rather than an empty one. redis-ipc multiplexes every watcher onto
-// one shared connection, so the count here does not translate into connections.
+// For each hash, HashWatcher.StartWithSync subscribes gated, does an HGETALL,
+// and replays every existing field synchronously through the same catch-all
+// used for live updates before it ungates the subscription. Start marks the
+// hash as seeding for the duration of that call: dispatchField still records
+// the replayed values in the shadow store (that is the only way to have a
+// correct "from" later), but does not turn them into events, since a value
+// that was already there before the process started is not a transition.
+// Only fields observed after StartWithSync returns are live and get
+// dispatched to sources, with "from" taken from the seeded value.
 func (a *Adapter) Start() error {
 	hashes := make(map[string]bool)
 	channels := make(map[string]bool)
@@ -74,6 +89,12 @@ func (a *Adapter) Start() error {
 		}
 	}
 
+	for name := range hashes {
+		if name != "" && channels[name] {
+			return fmt.Errorf("adapter: %q is registered as both a hash and a channel", name)
+		}
+	}
+
 	for h := range hashes {
 		hash := h
 		w := a.client.NewHashWatcher(hash)
@@ -81,7 +102,10 @@ func (a *Adapter) Start() error {
 			a.dispatchField(hash, field, value)
 			return nil
 		})
-		if err := w.StartWithSync(); err != nil {
+		a.setSeeding(hash, true)
+		err := w.StartWithSync()
+		a.setSeeding(hash, false)
+		if err != nil {
 			return fmt.Errorf("watch hash %s: %w", hash, err)
 		}
 		a.watchers = append(a.watchers, w)
@@ -114,9 +138,28 @@ func (a *Adapter) Stop() {
 	}
 }
 
+func (a *Adapter) setSeeding(hash string, seeding bool) {
+	a.seedingMu.Lock()
+	defer a.seedingMu.Unlock()
+	if seeding {
+		a.seeding[hash] = true
+	} else {
+		delete(a.seeding, hash)
+	}
+}
+
+func (a *Adapter) isSeeding(hash string) bool {
+	a.seedingMu.Lock()
+	defer a.seedingMu.Unlock()
+	return a.seeding[hash]
+}
+
 func (a *Adapter) dispatchField(hash, field, value string) {
 	prev, changed := a.shadow.Observe(hash, field, value)
 	if !changed {
+		return
+	}
+	if a.isSeeding(hash) {
 		return
 	}
 	for _, s := range a.sources {
