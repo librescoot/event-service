@@ -1,6 +1,9 @@
 package shadow
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 func TestObserveFirstValueIsAChangeWithEmptyPrev(t *testing.T) {
 	s := NewStore()
@@ -62,5 +65,55 @@ func TestGetUnknownReturnsEmpty(t *testing.T) {
 	s := NewStore()
 	if got := s.Get("nope", "nope"); got != "" {
 		t.Errorf("Get(unknown) = %q, want empty", got)
+	}
+}
+
+func TestObserveEmptyStringAsFirstValue(t *testing.T) {
+	s := NewStore()
+	prev, changed := s.Observe("config", "fallback", "")
+	if !changed {
+		t.Error("first observation of empty string should count as a change")
+	}
+	if prev != "" {
+		t.Errorf("prev = %q, want empty", prev)
+	}
+	prev, changed = s.Observe("config", "fallback", "")
+	if changed {
+		t.Error("repeat of empty string should not count as a change")
+	}
+	if prev != "" {
+		t.Errorf("prev = %q, want empty", prev)
+	}
+}
+
+func TestConcurrentObserveAndGet(t *testing.T) {
+	s := NewStore()
+	numGoroutines := 8
+	iterationsPerGoroutine := 500
+	var wg sync.WaitGroup
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterationsPerGoroutine; j++ {
+				hash := "hash-0"
+				field := "field-0"
+				value := "value"
+				_, _ = s.Observe(hash, field, value)
+				_ = s.Get(hash, field)
+				_ = s.Get(hash, "other-field")
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	prev, changed := s.Observe("hash-0", "field-0", "value")
+	if changed {
+		t.Error("after concurrent writes of same value, should not report a change")
+	}
+	if prev != "value" {
+		t.Errorf("prev = %q, want value", prev)
 	}
 }
