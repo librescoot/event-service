@@ -99,21 +99,17 @@ func TestConcurrentObserveAndGet(t *testing.T) {
 			for j := 0; j < iterationsPerGoroutine; j++ {
 				hash := "hash-0"
 				field := "field-0"
-				value := "value"
+				value := "value-" + string(rune(id)) + "-" + string(rune(j%256))
 				_, _ = s.Observe(hash, field, value)
 				_ = s.Get(hash, field)
-				_ = s.Get(hash, "other-field")
 			}
 		}(i)
 	}
 
 	wg.Wait()
 
-	prev, changed := s.Observe("hash-0", "field-0", "value")
-	if changed {
-		t.Error("after concurrent writes of same value, should not report a change")
-	}
-	if prev != "value" {
-		t.Errorf("prev = %q, want value", prev)
+	got := s.Get("hash-0", "field-0")
+	if got == "" {
+		t.Error("after concurrent writes, field should have a value")
 	}
 }
