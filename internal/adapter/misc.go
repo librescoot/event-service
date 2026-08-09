@@ -78,6 +78,9 @@ func (m *MiscSource) OnField(hash, field, value, prev string) []eventbus.Event {
 		}
 		return one(eventbus.TopicPowerStateChanged, prev, value)
 	case hash == "power-manager" && field == "wakeup-source":
+		if prev == "" {
+			return nil
+		}
 		e := ev(eventbus.TopicPowerWake, prev, value)
 		e.Data = map[string]any{"source": value}
 		return []eventbus.Event{e}

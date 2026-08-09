@@ -39,6 +39,13 @@ func TestMiscAlarmFirstObservationEmitsNothing(t *testing.T) {
 	}
 }
 
+func TestMiscPowerWakeFirstObservationEmitsNothing(t *testing.T) {
+	got := NewMiscSource(nil).OnField("power-manager", "wakeup-source", "button", "")
+	if len(got) != 0 {
+		t.Errorf("got %v, want nothing on first observation", topics(got))
+	}
+}
+
 func TestMiscOTAStatusIsPerComponent(t *testing.T) {
 	m := NewMiscSource(nil)
 

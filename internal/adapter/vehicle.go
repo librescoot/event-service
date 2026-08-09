@@ -47,15 +47,27 @@ func (v *VehicleSource) OnField(hash, field, value, prev string) []eventbus.Even
 	case "state":
 		return v.stateChange(value, prev)
 	case "seatbox:lock":
+		if prev == "" {
+			return nil
+		}
 		return one(pick(value == "open",
 			eventbus.TopicVehicleSeatboxOpened, eventbus.TopicVehicleSeatboxClosed), prev, value)
 	case "kickstand":
+		if prev == "" {
+			return nil
+		}
 		return one(pick(value == "up",
 			eventbus.TopicVehicleKickstandUp, eventbus.TopicVehicleKickstandDown), prev, value)
 	case "handlebar:lock-sensor":
+		if prev == "" {
+			return nil
+		}
 		return one(pick(value == "locked",
 			eventbus.TopicVehicleHandlebarLocked, eventbus.TopicVehicleHandlebarUnlocked), prev, value)
 	case "blinker:switch":
+		if prev == "" {
+			return nil
+		}
 		return one(eventbus.TopicVehicleBlinkerChanged, prev, value)
 	}
 	return nil

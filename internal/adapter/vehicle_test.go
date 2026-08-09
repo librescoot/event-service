@@ -173,6 +173,34 @@ func TestVehicleSeatboxAndKickstand(t *testing.T) {
 	}
 }
 
+func TestVehicleSeatboxFirstObservationEmitsNothing(t *testing.T) {
+	got := NewVehicleSource().OnField("vehicle", "seatbox:lock", "closed", "")
+	if len(got) != 0 {
+		t.Errorf("got %v, want nothing on first observation", topics(got))
+	}
+}
+
+func TestVehicleKickstandFirstObservationEmitsNothing(t *testing.T) {
+	got := NewVehicleSource().OnField("vehicle", "kickstand", "up", "")
+	if len(got) != 0 {
+		t.Errorf("got %v, want nothing on first observation", topics(got))
+	}
+}
+
+func TestVehicleHandlebarLockFirstObservationEmitsNothing(t *testing.T) {
+	got := NewVehicleSource().OnField("vehicle", "handlebar:lock-sensor", "locked", "")
+	if len(got) != 0 {
+		t.Errorf("got %v, want nothing on first observation", topics(got))
+	}
+}
+
+func TestVehicleBlinkerFirstObservationEmitsNothing(t *testing.T) {
+	got := NewVehicleSource().OnField("vehicle", "blinker:switch", "off", "")
+	if len(got) != 0 {
+		t.Errorf("got %v, want nothing on first observation", topics(got))
+	}
+}
+
 func TestVehicleIgnoresUnrelatedFields(t *testing.T) {
 	got := NewVehicleSource().OnField("vehicle", "auto-standby-deadline", "1780000000", "0")
 	if len(got) != 0 {
