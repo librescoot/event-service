@@ -19,15 +19,15 @@ type Config struct {
 // RuleConfig is one [[rule]] block as written on disk. It is the wire format,
 // not the runtime shape: Compile turns it into a Rule.
 type RuleConfig struct {
-	Name        string       `toml:"name"`
-	On          []string     `toml:"on"`
-	When        string       `toml:"when"`
-	Cooldown    string       `toml:"cooldown"`
-	Debounce    string       `toml:"debounce"`
-	Enabled     *bool        `toml:"enabled"`
-	Steps       []StepConfig `toml:"step"`
-	Concurrency string       `toml:"concurrency"`
-	CancelOn    []string     `toml:"cancel-on"`
+	Name        string         `toml:"name"`
+	On          []string       `toml:"on"`
+	When        string         `toml:"when"`
+	Cooldown    string         `toml:"cooldown"`
+	Debounce    string         `toml:"debounce"`
+	Enabled     *bool          `toml:"enabled"`
+	Steps       []StepConfig   `toml:"step"`
+	Concurrency string         `toml:"concurrency"`
+	CancelOn    []string       `toml:"cancel-on"`
 	Repeat      map[string]any `toml:"repeat"`
 
 	// Source names the file this rule came from, so an error message can tell

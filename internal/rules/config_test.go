@@ -120,3 +120,110 @@ repeat = { interval = "5s" }
 		t.Errorf("Repeat = %v, want {interval: 5s}", rule.Repeat)
 	}
 }
+
+// Each rule must carry the correct Source filename so error messages can
+// tell the user which file to edit. A regression that dropped tagging or
+// only tagged the first file would pass the other tests.
+func TestLoadTagsRulesWithSourceFilename(t *testing.T) {
+	dir := t.TempDir()
+	writeTOML(t, dir, "rules-a.toml", `
+[[rule]]
+name = "from-a"
+on   = ["x.y"]
+  [[rule.step]]
+  do = "redis"
+  list = "l"
+  push = "p"
+`)
+	writeTOML(t, dir, "rules-b.toml", `
+[[rule]]
+name = "from-b-first"
+on   = ["x.y"]
+  [[rule.step]]
+  do = "redis"
+  list = "l"
+  push = "p"
+[[rule]]
+name = "from-b-second"
+on   = ["x.y"]
+  [[rule.step]]
+  do = "redis"
+  list = "l"
+  push = "p"
+`)
+
+	cfg, errs := Load(dir)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	// Verify each rule has the correct source file tagged.
+	if len(cfg.Rules) != 3 {
+		t.Fatalf("got %d rules, want 3", len(cfg.Rules))
+	}
+
+	if cfg.Rules[0].Name != "from-a" || cfg.Rules[0].Source != "rules-a.toml" {
+		t.Errorf("rule 0: name=%q, source=%q, want name=from-a source=rules-a.toml", cfg.Rules[0].Name, cfg.Rules[0].Source)
+	}
+	if cfg.Rules[1].Name != "from-b-first" || cfg.Rules[1].Source != "rules-b.toml" {
+		t.Errorf("rule 1: name=%q, source=%q, want name=from-b-first source=rules-b.toml", cfg.Rules[1].Name, cfg.Rules[1].Source)
+	}
+	if cfg.Rules[2].Name != "from-b-second" || cfg.Rules[2].Source != "rules-b.toml" {
+		t.Errorf("rule 2: name=%q, source=%q, want name=from-b-second source=rules-b.toml", cfg.Rules[2].Name, cfg.Rules[2].Source)
+	}
+}
+
+// Files must be read in alphabetical order by filename, not creation order.
+// A regression that deleted sort.Strings would pass if os.ReadDir happened
+// to return entries in alphabetical order, so we write files in reverse
+// alphabetical order and verify the result is still alphabetical.
+func TestLoadReadsDeterministicOrder(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write files in reverse alphabetical order (z, y, x) to force a difference
+	// between creation order and alphabetical order.
+	writeTOML(t, dir, "z-last.toml", `
+[[rule]]
+name = "z"
+on   = ["x.y"]
+  [[rule.step]]
+  do = "redis"
+  list = "l"
+  push = "p"
+`)
+	writeTOML(t, dir, "y-middle.toml", `
+[[rule]]
+name = "y"
+on   = ["x.y"]
+  [[rule.step]]
+  do = "redis"
+  list = "l"
+  push = "p"
+`)
+	writeTOML(t, dir, "x-first.toml", `
+[[rule]]
+name = "x"
+on   = ["x.y"]
+  [[rule.step]]
+  do = "redis"
+  list = "l"
+  push = "p"
+`)
+
+	cfg, errs := Load(dir)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(cfg.Rules) != 3 {
+		t.Fatalf("got %d rules, want 3", len(cfg.Rules))
+	}
+
+	// Rules should be in alphabetical order by filename, not creation order.
+	want := []string{"x", "y", "z"}
+	for i, wantName := range want {
+		if cfg.Rules[i].Name != wantName {
+			t.Errorf("rule %d: name=%q, want %q", i, cfg.Rules[i].Name, wantName)
+		}
+	}
+}
