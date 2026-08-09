@@ -11,14 +11,31 @@ func TestMiscAlarmStatus(t *testing.T) {
 	cases := []struct{ value, prev, want string }{
 		{"armed", "disarmed", eventbus.TopicAlarmArmed},
 		{"disarmed", "armed", eventbus.TopicAlarmDisarmed},
+		{"disabled", "armed", eventbus.TopicAlarmDisarmed},
 		{"level-1-triggered", "armed", eventbus.TopicAlarmTriggered},
 		{"level-2-triggered", "level-1-triggered", eventbus.TopicAlarmTriggered},
 	}
 	for _, c := range cases {
 		got := m.OnField("alarm", "status", c.value, c.prev)
-		if len(got) != 1 || got[0].Topic != c.want {
-			t.Errorf("alarm status %s: got %v, want [%s]", c.value, topics(got), c.want)
+		if len(got) != 2 || got[0].Topic != eventbus.TopicAlarmStatusChanged || got[1].Topic != c.want {
+			t.Errorf("alarm status %s: got %v, want [alarm.status.changed %s]", c.value, topics(got), c.want)
 		}
+	}
+}
+
+func TestMiscAlarmUnnamedStatesEmitOnlyTheCompleteRecord(t *testing.T) {
+	m := NewMiscSource()
+	for _, value := range []string{"delay-armed", "seatbox-access"} {
+		got := m.OnField("alarm", "status", value, "armed")
+		if len(got) != 1 || got[0].Topic != eventbus.TopicAlarmStatusChanged {
+			t.Errorf("alarm status %s: got %v, want only [alarm.status.changed]", value, topics(got))
+		}
+	}
+}
+
+func TestMiscAlarmFirstObservationEmitsNothing(t *testing.T) {
+	if got := NewMiscSource().OnField("alarm", "status", "armed", ""); len(got) != 0 {
+		t.Errorf("got %v, want nothing on first observation", topics(got))
 	}
 }
 

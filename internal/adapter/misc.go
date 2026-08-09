@@ -91,18 +91,28 @@ func (m *MiscSource) OnMessage(channel, payload string) []eventbus.Event {
 	return nil
 }
 
+// alarm always emits the complete record when there is a known previous
+// value, then appends a named topic for the three groups a rule is likely to
+// key on. delay-armed, seatbox-access and unknown carry no name of their own;
+// a rule that wants them reads alarm.status.changed directly.
 func (m *MiscSource) alarm(value, prev string) []eventbus.Event {
+	if prev == "" {
+		return nil
+	}
+
+	out := []eventbus.Event{ev(eventbus.TopicAlarmStatusChanged, prev, value)}
+
 	switch {
 	case value == "armed":
-		return one(eventbus.TopicAlarmArmed, prev, value)
+		out = append(out, ev(eventbus.TopicAlarmArmed, prev, value))
 	case value == "disarmed" || value == "disabled":
-		return one(eventbus.TopicAlarmDisarmed, prev, value)
+		out = append(out, ev(eventbus.TopicAlarmDisarmed, prev, value))
 	case strings.HasSuffix(value, "-triggered"):
 		e := ev(eventbus.TopicAlarmTriggered, prev, value)
 		e.Data = map[string]any{"level": alarmLevel(value)}
-		return []eventbus.Event{e}
+		out = append(out, e)
 	}
-	return nil
+	return out
 }
 
 func alarmLevel(status string) int {
