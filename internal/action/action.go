@@ -7,8 +7,10 @@ package action
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/librescoot/eventbus"
 )
@@ -151,4 +153,45 @@ func (p *Pool) Stats() Stats {
 		Dropped:    p.dropped.Load(),
 		Failed:     p.failed.Load(),
 	}
+}
+
+// Spec is the action-shaped subset of a rule step. It exists so this package
+// does not import the rules package, which would be circular.
+type Spec struct {
+	Do      string
+	List    string
+	Push    string
+	Command string
+	Timeout string
+}
+
+// Build turns a step spec into a runnable action.
+func Build(s Spec, c Pusher) (Action, error) {
+	switch s.Do {
+	case "redis":
+		return NewRedisAction(c, s.List, s.Push)
+	case "exec":
+		timeout, err := parseTimeout(s.Timeout)
+		if err != nil {
+			return nil, err
+		}
+		return NewExecAction(s.Command, timeout)
+	case "can", "lua", "http":
+		return nil, fmt.Errorf("action %q is not supported yet", s.Do)
+	case "":
+		return nil, fmt.Errorf("step is missing do")
+	default:
+		return nil, fmt.Errorf("unknown action %q", s.Do)
+	}
+}
+
+func parseTimeout(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("timeout: %w", err)
+	}
+	return d, nil
 }
