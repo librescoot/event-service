@@ -39,19 +39,6 @@ func TestMiscAlarmFirstObservationEmitsNothing(t *testing.T) {
 	}
 }
 
-func TestMiscGPSFixEdgesOnly(t *testing.T) {
-	m := NewMiscSource(nil)
-	if got := m.OnField("gps", "fix", "3d", "none"); len(got) != 1 || got[0].Topic != eventbus.TopicGPSFixAcquired {
-		t.Errorf("got %v, want [gps.fix.acquired]", topics(got))
-	}
-	if got := m.OnField("gps", "fix", "2d", "3d"); len(got) != 0 {
-		t.Errorf("3d -> 2d is still a fix, got %v, want nothing", topics(got))
-	}
-	if got := m.OnField("gps", "fix", "none", "3d"); len(got) != 1 || got[0].Topic != eventbus.TopicGPSFixLost {
-		t.Errorf("got %v, want [gps.fix.lost]", topics(got))
-	}
-}
-
 func TestMiscOTAStatusIsPerComponent(t *testing.T) {
 	m := NewMiscSource(nil)
 

@@ -56,7 +56,7 @@ func NewMiscSource(look Lookup) *MiscSource { return &MiscSource{look: look} }
 // motion:interrupt channel gives the edges, which is all a rule wants.
 func (m *MiscSource) Hashes() []string {
 	return []string{
-		"power-manager", "alarm", "gps", "internet",
+		"power-manager", "alarm", "internet",
 		"ota", "keycard", "dashboard",
 	}
 }
@@ -72,8 +72,6 @@ func (m *MiscSource) OnField(hash, field, value, prev string) []eventbus.Event {
 	switch {
 	case hash == "alarm" && field == "status":
 		return m.alarm(value, prev)
-	case hash == "gps" && field == "fix":
-		return m.gpsFix(value, prev)
 	case hash == "power-manager" && field == "state":
 		if prev == "" {
 			return nil
@@ -157,21 +155,6 @@ func alarmLevel(status string) int {
 		return 2
 	}
 	return 0
-}
-
-// gpsFix fires only on the edge between having a fix and not having one.
-// Moving between 2d and 3d is not something a rule cares about, and emitting
-// it would add noise every time the sky opened up.
-func (m *MiscSource) gpsFix(value, prev string) []eventbus.Event {
-	had := prev != "" && prev != "none"
-	has := value != "" && value != "none"
-	switch {
-	case !had && has:
-		return one(eventbus.TopicGPSFixAcquired, prev, value)
-	case had && !has:
-		return one(eventbus.TopicGPSFixLost, prev, value)
-	}
-	return nil
 }
 
 func (m *MiscSource) keycard(value, prev string) []eventbus.Event {
