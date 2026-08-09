@@ -13,11 +13,11 @@ func TestMatchTopicExact(t *testing.T) {
 
 func TestMatchTopicTrailingGlob(t *testing.T) {
 	cases := map[string]bool{
-		"battery.inserted":      true,
+		"battery.inserted":       true,
 		"battery.charge.changed": true,
-		"battery":               false, // the prefix alone is not a child
-		"batteryx.inserted":     false, // must break on a dot, not a prefix
-		"vehicle.unlocked":      false,
+		"battery":                false, // the prefix alone is not a child
+		"batteryx.inserted":      false, // must break on a dot, not a prefix
+		"vehicle.unlocked":       false,
 	}
 	for topic, want := range cases {
 		if got := MatchTopic("battery.*", topic); got != want {
