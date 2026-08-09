@@ -91,6 +91,58 @@ func TestMatchesExposesStateFunction(t *testing.T) {
 	if err != nil || !ok {
 		t.Errorf("want match, got ok=%v err=%v", ok, err)
 	}
+
+	disarmed := func(hash, field string) string {
+		if hash == "alarm" && field == "status" {
+			return "disarmed"
+		}
+		return ""
+	}
+	r2 := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"motion.detected"},
+		When:  `state("alarm", "status") == "armed"`,
+		Steps: []StepConfig{redisStep()},
+	}, disarmed)
+	ok, _ = r2.Matches(eventbus.Event{Topic: "motion.detected"})
+	if ok {
+		t.Error("state() returning disarmed must not match")
+	}
+}
+
+func TestCompileRejectsMissingName(t *testing.T) {
+	_, errs := Compile([]RuleConfig{{
+		On: []string{"x.y"}, Steps: []StepConfig{redisStep()},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1", len(errs))
+	}
+	if !strings.Contains(errs[0].Error(), "missing name") {
+		t.Errorf("error should name the problem, got %v", errs[0])
+	}
+}
+
+func TestCompileRejectsMissingOn(t *testing.T) {
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", Steps: []StepConfig{redisStep()},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1", len(errs))
+	}
+	if !strings.Contains(errs[0].Error(), "missing on") {
+		t.Errorf("error should name the problem, got %v", errs[0])
+	}
+}
+
+func TestCompileRejectsMissingSteps(t *testing.T) {
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", On: []string{"x.y"},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1", len(errs))
+	}
+	if !strings.Contains(errs[0].Error(), "missing step") {
+		t.Errorf("error should name the problem, got %v", errs[0])
+	}
 }
 
 func TestCompileRejectsUnsupportedFeaturesByName(t *testing.T) {
