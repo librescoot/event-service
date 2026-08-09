@@ -9,9 +9,9 @@ import (
 )
 
 type fakePusher struct {
-	mu   sync.Mutex
-	got  []string
-	err  error
+	mu  sync.Mutex
+	got []string
+	err error
 }
 
 func (f *fakePusher) LPush(key string, values ...any) (int64, error) {
