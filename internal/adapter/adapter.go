@@ -166,7 +166,7 @@ func (a *Adapter) dispatchField(hash, field, value string) {
 		if !contains(s.Hashes(), hash) {
 			continue
 		}
-		a.emit(s.OnField(hash, field, value, prev))
+		a.emit(a.callOnField(s, hash, field, value, prev))
 	}
 }
 
@@ -175,8 +175,32 @@ func (a *Adapter) dispatchMessage(channel, payload string) {
 		if !contains(s.Channels(), channel) {
 			continue
 		}
-		a.emit(s.OnMessage(channel, payload))
+		a.emit(a.callOnMessage(s, channel, payload))
 	}
+}
+
+// callOnField calls s.OnField and recovers a panic in it. A bug in one
+// source's derivation must not kill the watcher goroutine, which would take
+// down every other source and, once the goroutine's panic reaches the
+// runtime, the process. It is logged rather than surfaced as an event error,
+// since there is no eventbus.Event to attach it to.
+func (a *Adapter) callOnField(s Source, hash, field, value, prev string) (evs []eventbus.Event) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("recovered panic in OnField(hash=%s field=%s): %v", hash, field, r)
+		}
+	}()
+	return s.OnField(hash, field, value, prev)
+}
+
+// callOnMessage is callOnField's counterpart for OnMessage.
+func (a *Adapter) callOnMessage(s Source, channel, payload string) (evs []eventbus.Event) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("recovered panic in OnMessage(channel=%s): %v", channel, r)
+		}
+	}()
+	return s.OnMessage(channel, payload)
 }
 
 // emit publishes derived events. A failure to publish one event must not stop

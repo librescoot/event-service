@@ -4,6 +4,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/librescoot/event-service/internal/shadow"
 	"github.com/librescoot/eventbus"
 )
 
@@ -21,6 +22,22 @@ func (f *fakeSource) OnField(hash, field, value, prev string) []eventbus.Event {
 }
 func (f *fakeSource) OnMessage(channel, payload string) []eventbus.Event {
 	return f.messages
+}
+
+// panicSource simulates a bug in a derivation, to prove one source panicking
+// does not take down the dispatch loop or the sources registered after it.
+type panicSource struct {
+	hashes   []string
+	channels []string
+}
+
+func (p *panicSource) Hashes() []string   { return p.hashes }
+func (p *panicSource) Channels() []string { return p.channels }
+func (p *panicSource) OnField(hash, field, value, prev string) []eventbus.Event {
+	panic("boom: OnField")
+}
+func (p *panicSource) OnMessage(channel, payload string) []eventbus.Event {
+	panic("boom: OnMessage")
 }
 
 func TestSubscriptionsIsTheUnionOfSources(t *testing.T) {
@@ -48,5 +65,31 @@ func TestSubscriptionsNeverContainsAWildcard(t *testing.T) {
 		if s == "*" || s == "" {
 			t.Errorf("Subscriptions() contains %q; the adapter must never subscribe broadly", s)
 		}
+	}
+}
+
+func TestDispatchFieldRecoversPanicAndOtherSourcesStillFire(t *testing.T) {
+	em := &collectingEmitter{}
+	a := New(nil, em, shadow.NewStore())
+	a.Register(&panicSource{hashes: []string{"vehicle"}})
+	a.Register(&fakeSource{hashes: []string{"vehicle"}, fields: []eventbus.Event{eventbus.New("survivor.field", "test")}})
+
+	a.dispatchField("vehicle", "state", "parked")
+
+	if got := em.count(); got != 1 {
+		t.Fatalf("emitted %d events, want 1 from the source registered after the panicking one", got)
+	}
+}
+
+func TestDispatchMessageRecoversPanicAndOtherSourcesStillFire(t *testing.T) {
+	em := &collectingEmitter{}
+	a := New(nil, em, shadow.NewStore())
+	a.Register(&panicSource{channels: []string{"input-events"}})
+	a.Register(&fakeSource{channels: []string{"input-events"}, messages: []eventbus.Event{eventbus.New("survivor.message", "test")}})
+
+	a.dispatchMessage("input-events", "horn:tap")
+
+	if got := em.count(); got != 1 {
+		t.Fatalf("emitted %d events, want 1 from the source registered after the panicking one", got)
 	}
 }
