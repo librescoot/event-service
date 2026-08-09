@@ -35,7 +35,7 @@ func TestInputAllGestures(t *testing.T) {
 }
 
 func TestInputRejectsMalformed(t *testing.T) {
-	for _, payload := range []string{"", "horn", "horn:", ":tap", "a:b:c:d"} {
+	for _, payload := range []string{"", "horn", "horn:", ":tap", "a:b:c:d", ":brake:left:hold", "a:b:c:tap"} {
 		if got := NewInputSource().OnMessage("input-events", payload); len(got) != 0 {
 			t.Errorf("payload %q: got %v, want nothing", payload, topics(got))
 		}
