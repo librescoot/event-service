@@ -1,0 +1,124 @@
+package adapter
+
+import (
+	"testing"
+
+	"github.com/librescoot/eventbus"
+)
+
+func topics(evs []eventbus.Event) []string {
+	out := make([]string, len(evs))
+	for i, e := range evs {
+		out[i] = e.Topic
+	}
+	return out
+}
+
+func TestVehicleStateChangeAlwaysEmitsTheCompleteRecord(t *testing.T) {
+	v := NewVehicleSource()
+	evs := v.OnField("vehicle", "state", "waiting-seatbox", "parked")
+
+	if len(evs) != 1 {
+		t.Fatalf("topics = %v, want exactly the complete record", topics(evs))
+	}
+	e := evs[0]
+	if e.Topic != eventbus.TopicVehicleStateChanged {
+		t.Errorf("Topic = %q", e.Topic)
+	}
+	if e.From != "parked" || e.To != "waiting-seatbox" {
+		t.Errorf("from/to = %q/%q, want parked/waiting-seatbox", e.From, e.To)
+	}
+	if e.Src != "adapter" {
+		t.Errorf("Src = %q, want adapter", e.Src)
+	}
+}
+
+func TestVehicleUnlockEmitsBothTopics(t *testing.T) {
+	v := NewVehicleSource()
+	got := topics(v.OnField("vehicle", "state", "parked", "stand-by"))
+
+	want := map[string]bool{
+		eventbus.TopicVehicleUnlocked:     false,
+		eventbus.TopicVehicleStateChanged: false,
+	}
+	for _, tp := range got {
+		if _, ok := want[tp]; !ok {
+			t.Errorf("unexpected topic %q", tp)
+			continue
+		}
+		want[tp] = true
+	}
+	for tp, seen := range want {
+		if !seen {
+			t.Errorf("missing topic %q (got %v)", tp, got)
+		}
+	}
+}
+
+func TestVehicleNamedTransitions(t *testing.T) {
+	cases := []struct {
+		from, to string
+		want     string
+	}{
+		{"stand-by", "parked", eventbus.TopicVehicleUnlocked},
+		{"parked", "stand-by", eventbus.TopicVehicleLocked},
+		{"ready-to-drive", "stand-by", eventbus.TopicVehicleLocked},
+		{"parked", "ready-to-drive", eventbus.TopicRideStarted},
+		{"ready-to-drive", "parked", eventbus.TopicRideEnded},
+		{"parked", "waiting-hibernation", eventbus.TopicVehicleHibernating},
+	}
+	for _, c := range cases {
+		got := topics(NewVehicleSource().OnField("vehicle", "state", c.to, c.from))
+		found := false
+		for _, tp := range got {
+			if tp == c.want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s -> %s: got %v, want it to include %q", c.from, c.to, got, c.want)
+		}
+	}
+}
+
+func TestVehicleNoNamedTopicForUninterestingTransition(t *testing.T) {
+	got := topics(NewVehicleSource().OnField("vehicle", "state", "hop-on", "parked"))
+	if len(got) != 1 || got[0] != eventbus.TopicVehicleStateChanged {
+		t.Errorf("got %v, want only the complete record", got)
+	}
+}
+
+func TestVehicleFirstObservationEmitsNothing(t *testing.T) {
+	got := NewVehicleSource().OnField("vehicle", "state", "parked", "")
+	if len(got) != 0 {
+		t.Errorf("got %v, want nothing; there is no transition from an unknown state", topics(got))
+	}
+}
+
+func TestVehicleSeatboxAndKickstand(t *testing.T) {
+	v := NewVehicleSource()
+	cases := []struct {
+		field, value, prev string
+		want               string
+	}{
+		{"seatbox:lock", "open", "closed", eventbus.TopicVehicleSeatboxOpened},
+		{"seatbox:lock", "closed", "open", eventbus.TopicVehicleSeatboxClosed},
+		{"kickstand", "up", "down", eventbus.TopicVehicleKickstandUp},
+		{"kickstand", "down", "up", eventbus.TopicVehicleKickstandDown},
+		{"handlebar:lock-sensor", "locked", "unlocked", eventbus.TopicVehicleHandlebarLocked},
+		{"blinker:switch", "left", "off", eventbus.TopicVehicleBlinkerChanged},
+	}
+	for _, c := range cases {
+		got := topics(v.OnField("vehicle", c.field, c.value, c.prev))
+		if len(got) != 1 || got[0] != c.want {
+			t.Errorf("%s=%s (was %s): got %v, want [%s]", c.field, c.value, c.prev, got, c.want)
+		}
+	}
+}
+
+func TestVehicleIgnoresUnrelatedFields(t *testing.T) {
+	got := NewVehicleSource().OnField("vehicle", "auto-standby-deadline", "1780000000", "0")
+	if len(got) != 0 {
+		t.Errorf("got %v, want nothing", topics(got))
+	}
+}
