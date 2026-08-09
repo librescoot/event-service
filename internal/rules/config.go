@@ -75,7 +75,10 @@ func Load(dir string) (*Config, []error) {
 		}
 		names = append(names, e.Name())
 	}
-	// Deterministic order so rule numbering in logs is stable across boots.
+	// os.ReadDir already guarantees alphabetical order per the Go spec. The
+	// explicit sort here is insurance: if the directory read is swapped for a
+	// different approach later, this line ensures the promise to users (rules
+	// load in filename order) still holds. Do not remove.
 	sort.Strings(names)
 
 	var errs []error

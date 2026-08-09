@@ -173,15 +173,19 @@ on   = ["x.y"]
 	}
 }
 
-// Files must be read in alphabetical order by filename, not creation order.
-// A regression that deleted sort.Strings would pass if os.ReadDir happened
-// to return entries in alphabetical order, so we write files in reverse
-// alphabetical order and verify the result is still alphabetical.
-func TestLoadReadsDeterministicOrder(t *testing.T) {
+// Rules must be loaded in alphabetical order by filename so rule numbering
+// is predictable and stable across boots. This test verifies the observable
+// property.
+//
+// Note: os.ReadDir already guarantees alphabetical order per the Go spec, so
+// this test cannot distinguish between ordering enforced by sort.Strings and
+// ordering from os.ReadDir. A deletion of sort.Strings would not cause this
+// test to fail on current Go versions. The sort call exists as insurance for
+// future changes to the directory reading mechanism.
+func TestLoadRulesInFilenameOrder(t *testing.T) {
 	dir := t.TempDir()
 
-	// Write files in reverse alphabetical order (z, y, x) to force a difference
-	// between creation order and alphabetical order.
+	// Write files in reverse alphabetical order (z, y, x).
 	writeTOML(t, dir, "z-last.toml", `
 [[rule]]
 name = "z"
@@ -219,7 +223,7 @@ on   = ["x.y"]
 		t.Fatalf("got %d rules, want 3", len(cfg.Rules))
 	}
 
-	// Rules should be in alphabetical order by filename, not creation order.
+	// Rules should be in alphabetical order by filename.
 	want := []string{"x", "y", "z"}
 	for i, wantName := range want {
 		if cfg.Rules[i].Name != wantName {
