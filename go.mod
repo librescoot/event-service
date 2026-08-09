@@ -4,6 +4,7 @@ go 1.25.7
 
 require (
 	github.com/BurntSushi/toml v1.6.0
+	github.com/expr-lang/expr v1.17.8
 	github.com/librescoot/eventbus v0.1.0
 	github.com/librescoot/redis-ipc v0.15.2
 )
