@@ -12,9 +12,12 @@ type Emitter interface {
 
 // Source derives events from one domain.
 //
-// Implementations are pure: they return the events a change implies and never
-// publish, sleep, or touch the datastore. That keeps every derivation
-// unit-testable and keeps all I/O in Adapter.
+// Implementations must not publish or block. The one permitted exception is
+// a narrow live read through an injected Lookup (see MiscSource.keycard),
+// used where a companion field is written without its own notification and
+// the value can only be recovered by reading it directly at emit time. That
+// keeps every derivation unit-testable with a fake Lookup and keeps the rest
+// of the I/O in Adapter.
 type Source interface {
 	// Hashes lists the hashes this source needs field-level notifications for.
 	// The adapter watches each one and calls OnField.
