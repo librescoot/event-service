@@ -62,7 +62,10 @@ func (v *VehicleSource) OnField(hash, field, value, prev string) []eventbus.Even
 }
 
 // stateChange emits the complete record for every transition, plus a named
-// topic for the five transitions worth naming.
+// topic for each of the five transitions worth naming that apply.
+//
+// Locking while riding is both a ride ending and a lock happening, so a
+// single hash transition can carry two names; that is intended, not a bug.
 //
 // A transition out of an unknown previous state is not a transition, it is the
 // adapter learning where the vehicle already was, so it emits nothing.
@@ -73,26 +76,37 @@ func (v *VehicleSource) stateChange(to, from string) []eventbus.Event {
 
 	out := []eventbus.Event{ev(eventbus.TopicVehicleStateChanged, from, to)}
 
-	if named := namedTransition(from, to); named != "" {
+	for _, named := range namedTransition(from, to) {
 		out = append(out, ev(named, from, to))
 	}
 	return out
 }
 
-func namedTransition(from, to string) string {
-	switch {
-	case to == stateParked && from == stateStandBy:
-		return eventbus.TopicVehicleUnlocked
-	case to == stateStandBy:
-		return eventbus.TopicVehicleLocked
-	case to == stateReadyToDrive:
-		return eventbus.TopicRideStarted
-	case from == stateReadyToDrive:
-		return eventbus.TopicRideEnded
-	case isHibernating(to):
-		return eventbus.TopicVehicleHibernating
+// namedTransition reports every name this transition deserves, not just the
+// first match. ready-to-drive -> stand-by, for example, is both ride.ended
+// and vehicle.locked.
+func namedTransition(from, to string) []string {
+	var names []string
+	if to == stateParked && from == stateStandBy {
+		names = append(names, eventbus.TopicVehicleUnlocked)
 	}
-	return ""
+	if to == stateStandBy {
+		names = append(names, eventbus.TopicVehicleLocked)
+	}
+	if to == stateReadyToDrive {
+		names = append(names, eventbus.TopicRideStarted)
+	}
+	if from == stateReadyToDrive {
+		names = append(names, eventbus.TopicRideEnded)
+	}
+	// Guarded by !isHibernating(from) so climbing the waiting-hibernation ->
+	// -seatbox -> -confirm ladder only fires once, on the step that enters
+	// it. Movement within the ladder is still visible via
+	// vehicle.state.changed.
+	if isHibernating(to) && !isHibernating(from) {
+		names = append(names, eventbus.TopicVehicleHibernating)
+	}
+	return names
 }
 
 func isHibernating(state string) bool {
