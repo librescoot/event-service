@@ -52,21 +52,6 @@ func TestMiscGPSFixEdgesOnly(t *testing.T) {
 	}
 }
 
-func TestMiscECUFaultRaisedAndCleared(t *testing.T) {
-	m := NewMiscSource(nil)
-	got := m.OnField("engine-ecu", "fault:code", "42", "0")
-	if len(got) != 1 || got[0].Topic != eventbus.TopicECUFaultRaised {
-		t.Fatalf("got %v, want [ecu.fault.raised]", topics(got))
-	}
-	if got[0].Data["code"] != 42 {
-		t.Errorf("code = %v, want 42", got[0].Data["code"])
-	}
-	got = m.OnField("engine-ecu", "fault:code", "0", "42")
-	if len(got) != 1 || got[0].Topic != eventbus.TopicECUFaultCleared {
-		t.Errorf("got %v, want [ecu.fault.cleared]", topics(got))
-	}
-}
-
 func TestMiscOTAStatusIsPerComponent(t *testing.T) {
 	m := NewMiscSource(nil)
 

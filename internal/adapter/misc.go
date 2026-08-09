@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/librescoot/eventbus"
@@ -58,7 +57,7 @@ func NewMiscSource(look Lookup) *MiscSource { return &MiscSource{look: look} }
 func (m *MiscSource) Hashes() []string {
 	return []string{
 		"power-manager", "alarm", "gps", "internet",
-		"ota", "keycard", "dashboard", "engine-ecu",
+		"ota", "keycard", "dashboard",
 	}
 }
 
@@ -75,8 +74,6 @@ func (m *MiscSource) OnField(hash, field, value, prev string) []eventbus.Event {
 		return m.alarm(value, prev)
 	case hash == "gps" && field == "fix":
 		return m.gpsFix(value, prev)
-	case hash == "engine-ecu" && field == "fault:code":
-		return m.ecuFault(value, prev)
 	case hash == "power-manager" && field == "state":
 		if prev == "" {
 			return nil
@@ -173,30 +170,6 @@ func (m *MiscSource) gpsFix(value, prev string) []eventbus.Event {
 		return one(eventbus.TopicGPSFixAcquired, prev, value)
 	case had && !has:
 		return one(eventbus.TopicGPSFixLost, prev, value)
-	}
-	return nil
-}
-
-// ecuFault reports the fault edge. ecu-service writes fault:code as a decimal
-// uint32 (SetFault in ipc_tx.go), and only when it changes, so the field is
-// absent on a vehicle that has never faulted. First appearance therefore has
-// prev == "", which Atoi treats as 0, giving a correct "raised".
-func (m *MiscSource) ecuFault(value, prev string) []eventbus.Event {
-	code, err := strconv.Atoi(value)
-	if err != nil {
-		return nil
-	}
-	prevCode, _ := strconv.Atoi(prev)
-
-	switch {
-	case code != 0 && prevCode == 0:
-		e := ev(eventbus.TopicECUFaultRaised, prev, value)
-		e.Data = map[string]any{"code": code}
-		return []eventbus.Event{e}
-	case code == 0 && prevCode != 0:
-		e := ev(eventbus.TopicECUFaultCleared, prev, value)
-		e.Data = map[string]any{"code": prevCode}
-		return []eventbus.Event{e}
 	}
 	return nil
 }
