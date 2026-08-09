@@ -10,6 +10,8 @@ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/r
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
 github.com/klauspost/cpuid/v2 v2.0.9 h1:lgaqFMSdTdQYdZ04uHyN2d/eKdOMyi2YLSvlQIBFYa4=
 github.com/klauspost/cpuid/v2 v2.0.9/go.mod h1:FInQzS24/EEf25PyTYn52gqo7WaD8xa0213Md/qVLRg=
+github.com/librescoot/eventbus v0.1.0 h1:CM0jteSfA+jSEHXA2lh0D2dHXSAHrJ6T0EuCiWYTEVs=
+github.com/librescoot/eventbus v0.1.0/go.mod h1:sSKIXixtMH98vowcy+jReKD3fAcfXT+1WYn7G4meTyM=
 github.com/librescoot/redis-ipc v0.15.2 h1:QH3Ns7MHBa957LPzWnA45+XSZFlJM9ZFSFIcEwb2eu4=
 github.com/librescoot/redis-ipc v0.15.2/go.mod h1:uvlJaUd1WzRMjZy7dYCHJ6qphCDeYD5orGK9CLudv1Q=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
