@@ -1,0 +1,191 @@
+package engine
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/librescoot/event-service/internal/action"
+	"github.com/librescoot/event-service/internal/rules"
+	"github.com/librescoot/eventbus"
+)
+
+type nopLog struct{}
+
+func (nopLog) Printf(string, ...any) {}
+
+type countingPusher struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (p *countingPusher) LPush(key string, values ...any) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.n++
+	return 1, nil
+}
+
+func (p *countingPusher) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.n
+}
+
+func compileRules(t *testing.T, cfgs ...rules.RuleConfig) []*rules.Rule {
+	t.Helper()
+	rs, errs := rules.Compile(cfgs, func(string, string) string { return "" })
+	if len(errs) != 0 {
+		t.Fatalf("compile: %v", errs)
+	}
+	return rs
+}
+
+func horn() rules.StepConfig {
+	return rules.StepConfig{Do: "redis", List: "scooter:horn", Push: "on"}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !cond() {
+		t.Fatal("condition not met within 2s")
+	}
+}
+
+func TestHandleDispatchesMatchingRule(t *testing.T) {
+	p := &countingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	rs := compileRules(t, rules.RuleConfig{Name: "r", On: []string{"alarm.triggered"}, Steps: []rules.StepConfig{horn()}})
+	en, errs := New(rs, pool, p, nopLog{})
+	if len(errs) != 0 {
+		t.Fatalf("New: %v", errs)
+	}
+
+	en.Handle(eventbus.Event{Topic: "alarm.triggered"})
+	waitFor(t, func() bool { return p.count() == 1 })
+}
+
+func TestHandleIgnoresNonMatchingTopic(t *testing.T) {
+	p := &countingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	rs := compileRules(t, rules.RuleConfig{Name: "r", On: []string{"alarm.triggered"}, Steps: []rules.StepConfig{horn()}})
+	en, _ := New(rs, pool, p, nopLog{})
+
+	en.Handle(eventbus.Event{Topic: "vehicle.unlocked"})
+	time.Sleep(100 * time.Millisecond)
+	if p.count() != 0 {
+		t.Errorf("dispatched %d times for a non-matching topic", p.count())
+	}
+}
+
+func TestCooldownSuppressesRepeatFires(t *testing.T) {
+	p := &countingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"motion.detected"}, Cooldown: "10s", Steps: []rules.StepConfig{horn()},
+	})
+	en, _ := New(rs, pool, p, nopLog{})
+
+	for i := 0; i < 5; i++ {
+		en.Handle(eventbus.Event{Topic: "motion.detected"})
+	}
+	waitFor(t, func() bool { return p.count() >= 1 })
+	time.Sleep(100 * time.Millisecond)
+	if got := p.count(); got != 1 {
+		t.Errorf("fired %d times inside a 10s cooldown, want 1", got)
+	}
+}
+
+// TestCooldownExpiresAndFiresAgain guards against a cooldown that latches
+// permanently, which would look identical to a correctly working cooldown in
+// TestCooldownSuppressesRepeatFires alone. A rule that fires once, then never
+// again, passes that test forever.
+func TestCooldownExpiresAndFiresAgain(t *testing.T) {
+	p := &countingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"motion.detected"}, Cooldown: "50ms", Steps: []rules.StepConfig{horn()},
+	})
+	en, _ := New(rs, pool, p, nopLog{})
+
+	en.Handle(eventbus.Event{Topic: "motion.detected"})
+	waitFor(t, func() bool { return p.count() >= 1 })
+
+	time.Sleep(100 * time.Millisecond)
+
+	en.Handle(eventbus.Event{Topic: "motion.detected"})
+	waitFor(t, func() bool { return p.count() >= 2 })
+
+	if got := p.count(); got != 2 {
+		t.Errorf("fired %d times across an expired cooldown, want 2", got)
+	}
+}
+
+func TestPatternsCoverEveryRuleTopic(t *testing.T) {
+	rs := compileRules(t,
+		rules.RuleConfig{Name: "a", On: []string{"alarm.triggered"}, Steps: []rules.StepConfig{horn()}},
+		rules.RuleConfig{Name: "b", On: []string{"battery.*"}, Steps: []rules.StepConfig{horn()}},
+	)
+	en, _ := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
+
+	got := en.Patterns()
+	want := map[string]bool{"ev:alarm.triggered": false, "ev:battery.*": false}
+	for _, p := range got {
+		if _, ok := want[p]; !ok {
+			t.Errorf("unexpected pattern %q", p)
+		}
+		want[p] = true
+	}
+	for p, seen := range want {
+		if !seen {
+			t.Errorf("missing pattern %q (got %v)", p, got)
+		}
+	}
+}
+
+func TestNewReportsUnbuildableRuleWithoutLosingTheRest(t *testing.T) {
+	rs := compileRules(t,
+		rules.RuleConfig{Name: "good", On: []string{"x.y"}, Steps: []rules.StepConfig{horn()}},
+		rules.RuleConfig{Name: "bad", On: []string{"x.y"}, Steps: []rules.StepConfig{{Do: "telepathy"}}},
+	)
+	en, errs := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	if n := en.RuleCount(); n != 1 {
+		t.Errorf("RuleCount() = %d, want 1; the good rule must survive", n)
+	}
+}
+
+// TestNewRejectsDebounceRule guards the deliberate gap in this task: Debounce
+// is parsed by rules.Compile but has no timer implementation here. Without
+// this rejection, a rule author writing debounce would get a rule that
+// silently behaves as if debounce were zero.
+func TestNewRejectsDebounceRule(t *testing.T) {
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"}, Debounce: "500ms", Steps: []rules.StepConfig{horn()},
+	})
+	en, errs := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	if n := en.RuleCount(); n != 0 {
+		t.Errorf("RuleCount() = %d, want 0; a debounce rule must not become live", n)
+	}
+}
