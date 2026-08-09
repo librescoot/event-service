@@ -141,3 +141,60 @@ func TestPoolStopWaitsForInFlightWork(t *testing.T) {
 		t.Error("Stop returned before in-flight work finished")
 	}
 }
+
+// A Submit that lands strictly after Stop has returned must be refused, not
+// sent: jobs is never closed, so if this ever tried to send on it directly
+// there would be nothing to panic on, but a naive implementation that closes
+// the job queue in Stop would panic right here.
+func TestSubmitAfterStopReturnsFalseWithoutPanic(t *testing.T) {
+	p := NewPool(1, 4, nopLog{})
+	p.Start()
+	p.Stop()
+
+	a := &fakeAction{}
+	if p.Submit(a, eventbus.Event{Topic: "x.y"}, "r") {
+		t.Error("Submit after Stop returned true, want false")
+	}
+	if s := p.Stats(); s.Dropped == 0 {
+		t.Error("Dropped must count a post-Stop submission")
+	}
+}
+
+// Several goroutines hammer Submit while another goroutine calls Stop, all
+// under -race and repeated across many pools so scheduling has room to hit
+// the send-during-close window. Against the closed-channel design this
+// panics with "send on closed channel" well before the loop count below is
+// reached; against the done-channel design there is no send that can ever
+// race a close, because jobs is never closed.
+func TestConcurrentSubmitAndStopDoesNotPanic(t *testing.T) {
+	const pools = 50
+	const submitters = 4
+	const submitsPerGoroutine = 200
+
+	for i := 0; i < pools; i++ {
+		p := NewPool(2, 8, nopLog{})
+		p.Start()
+
+		a := &fakeAction{}
+		var submitWG sync.WaitGroup
+		for g := 0; g < submitters; g++ {
+			submitWG.Add(1)
+			go func() {
+				defer submitWG.Done()
+				for j := 0; j < submitsPerGoroutine; j++ {
+					p.Submit(a, eventbus.Event{Topic: "x.y"}, "r")
+				}
+			}()
+		}
+
+		// Stop races the submitters directly: it is not gated on their
+		// completion, so some Submit calls land before, during, and after
+		// close(p.done).
+		p.Stop()
+		submitWG.Wait()
+
+		if p.Submit(a, eventbus.Event{Topic: "x.y"}, "r") {
+			t.Fatalf("pool %d: Submit after Stop returned true, want false", i)
+		}
+	}
+}
