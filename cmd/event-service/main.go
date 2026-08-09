@@ -8,6 +8,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/librescoot/event-service/internal/adapter"
+	"github.com/librescoot/event-service/internal/shadow"
+	"github.com/librescoot/eventbus"
 	ipc "github.com/librescoot/redis-ipc"
 )
 
@@ -40,6 +43,21 @@ func main() {
 		log.Fatalf("cannot reach datastore at %s: %v", *redisAddr, err)
 	}
 	defer client.Close()
+
+	sh := shadow.NewStore()
+	pub := eventbus.NewPublisher(client, "adapter")
+
+	ad := adapter.New(client, pub, sh)
+	ad.Register(adapter.NewVehicleSource())
+	ad.Register(adapter.NewInputSource())
+	ad.Register(adapter.NewBatterySource())
+	ad.Register(adapter.NewMiscSource(adapter.NewLiveLookup(client)))
+
+	log.Printf("subscribing to: %v", ad.Subscriptions())
+	if err := ad.Start(); err != nil {
+		log.Fatalf("adapter start: %v", err)
+	}
+	defer ad.Stop()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

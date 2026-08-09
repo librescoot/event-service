@@ -5,14 +5,51 @@ import (
 	"strings"
 
 	"github.com/librescoot/eventbus"
+	ipc "github.com/librescoot/redis-ipc"
 )
+
+// Lookup reads a single hash field. Narrow so tests can pass a map.
+//
+// The production implementation reads the datastore live. It deliberately does
+// NOT read the shadow store: keycard-service writes uid and type with
+// SetManyPublishOne, which notifies only on "authentication", so those fields
+// never reach the shadow store and reading them from there would return a
+// stale UID from an earlier tap.
+type Lookup interface {
+	Get(hash, field string) string
+}
+
+// LiveLookup reads fields straight from the datastore.
+//
+// Safe for the keycard case because SetManyPublishOne pipelines the field
+// writes ahead of the single publish, so every field is committed before the
+// notification that triggers this read.
+type LiveLookup struct {
+	client *ipc.Client
+}
+
+// NewLiveLookup returns a Lookup backed by the datastore.
+func NewLiveLookup(c *ipc.Client) *LiveLookup { return &LiveLookup{client: c} }
+
+// Get returns the field value, or empty if it is missing or unreadable. A
+// failed read is indistinguishable from an absent field here, which is what
+// the caller wants: it omits the key either way rather than emitting a blank.
+func (l *LiveLookup) Get(hash, field string) string {
+	v, err := l.client.HGet(hash, field)
+	if err != nil {
+		return ""
+	}
+	return v
+}
 
 // MiscSource covers the domains that need one or two derivations each and do
 // not justify their own file.
-type MiscSource struct{}
+type MiscSource struct {
+	look Lookup
+}
 
-// NewMiscSource returns a MiscSource.
-func NewMiscSource() *MiscSource { return &MiscSource{} }
+// NewMiscSource returns a MiscSource that reads companion fields through look.
+func NewMiscSource(look Lookup) *MiscSource { return &MiscSource{look: look} }
 
 // Hashes implements Source.
 //
@@ -165,11 +202,30 @@ func (m *MiscSource) ecuFault(value, prev string) []eventbus.Event {
 }
 
 func (m *MiscSource) keycard(value, prev string) []eventbus.Event {
+	var topic string
 	switch value {
 	case "passed":
-		return one(eventbus.TopicKeycardAuthPassed, prev, value)
+		topic = eventbus.TopicKeycardAuthPassed
 	case "failed":
-		return one(eventbus.TopicKeycardAuthFailed, prev, value)
+		topic = eventbus.TopicKeycardAuthFailed
+	default:
+		return nil
 	}
-	return nil
+
+	e := ev(topic, prev, value)
+	e.Data = map[string]any{}
+	// Omitting beats emitting an empty string, which a rule cannot
+	// distinguish from a real blank UID.
+	if m.look != nil {
+		if uid := m.look.Get("keycard", "uid"); uid != "" {
+			e.Data["uid"] = uid
+		}
+		if typ := m.look.Get("keycard", "type"); typ != "" {
+			e.Data["type"] = typ
+		}
+	}
+	if len(e.Data) == 0 {
+		e.Data = nil
+	}
+	return []eventbus.Event{e}
 }

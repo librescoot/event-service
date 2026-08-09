@@ -7,7 +7,7 @@ import (
 )
 
 func TestMiscAlarmStatus(t *testing.T) {
-	m := NewMiscSource()
+	m := NewMiscSource(nil)
 	cases := []struct{ value, prev, want string }{
 		{"armed", "disarmed", eventbus.TopicAlarmArmed},
 		{"disarmed", "armed", eventbus.TopicAlarmDisarmed},
@@ -24,7 +24,7 @@ func TestMiscAlarmStatus(t *testing.T) {
 }
 
 func TestMiscAlarmUnnamedStatesEmitOnlyTheCompleteRecord(t *testing.T) {
-	m := NewMiscSource()
+	m := NewMiscSource(nil)
 	for _, value := range []string{"delay-armed", "seatbox-access"} {
 		got := m.OnField("alarm", "status", value, "armed")
 		if len(got) != 1 || got[0].Topic != eventbus.TopicAlarmStatusChanged {
@@ -34,13 +34,13 @@ func TestMiscAlarmUnnamedStatesEmitOnlyTheCompleteRecord(t *testing.T) {
 }
 
 func TestMiscAlarmFirstObservationEmitsNothing(t *testing.T) {
-	if got := NewMiscSource().OnField("alarm", "status", "armed", ""); len(got) != 0 {
+	if got := NewMiscSource(nil).OnField("alarm", "status", "armed", ""); len(got) != 0 {
 		t.Errorf("got %v, want nothing on first observation", topics(got))
 	}
 }
 
 func TestMiscGPSFixEdgesOnly(t *testing.T) {
-	m := NewMiscSource()
+	m := NewMiscSource(nil)
 	if got := m.OnField("gps", "fix", "3d", "none"); len(got) != 1 || got[0].Topic != eventbus.TopicGPSFixAcquired {
 		t.Errorf("got %v, want [gps.fix.acquired]", topics(got))
 	}
@@ -53,7 +53,7 @@ func TestMiscGPSFixEdgesOnly(t *testing.T) {
 }
 
 func TestMiscECUFaultRaisedAndCleared(t *testing.T) {
-	m := NewMiscSource()
+	m := NewMiscSource(nil)
 	got := m.OnField("engine-ecu", "fault:code", "42", "0")
 	if len(got) != 1 || got[0].Topic != eventbus.TopicECUFaultRaised {
 		t.Fatalf("got %v, want [ecu.fault.raised]", topics(got))
@@ -68,7 +68,7 @@ func TestMiscECUFaultRaisedAndCleared(t *testing.T) {
 }
 
 func TestMiscOTAStatusIsPerComponent(t *testing.T) {
-	m := NewMiscSource()
+	m := NewMiscSource(nil)
 
 	// There is no bare "status" field on the ota hash.
 	if got := m.OnField("ota", "status", "installing", "idle"); len(got) != 0 {
@@ -89,8 +89,39 @@ func TestMiscOTAStatusIsPerComponent(t *testing.T) {
 	}
 }
 
+type fakeLookup map[string]string
+
+func (f fakeLookup) Get(hash, field string) string { return f[hash+"/"+field] }
+
+func TestKeycardEventCarriesUIDFromShadow(t *testing.T) {
+	sh := fakeLookup{
+		"keycard/uid":  "04a1b2c3",
+		"keycard/type": "scooter",
+	}
+	got := NewMiscSource(sh).OnField("keycard", "authentication", "passed", "")
+	if len(got) != 1 {
+		t.Fatalf("got %v, want one event", topics(got))
+	}
+	if got[0].Data["uid"] != "04a1b2c3" {
+		t.Errorf("uid = %v, want 04a1b2c3", got[0].Data["uid"])
+	}
+	if got[0].Data["type"] != "scooter" {
+		t.Errorf("type = %v, want scooter", got[0].Data["type"])
+	}
+}
+
+func TestKeycardEventOmitsUnknownUID(t *testing.T) {
+	got := NewMiscSource(fakeLookup{}).OnField("keycard", "authentication", "failed", "")
+	if len(got) != 1 {
+		t.Fatalf("got %v, want one event", topics(got))
+	}
+	if _, ok := got[0].Data["uid"]; ok {
+		t.Error("uid present but unknown; omit rather than emitting an empty string")
+	}
+}
+
 func TestMiscMotionInterruptIsEdgeOnly(t *testing.T) {
-	m := NewMiscSource()
+	m := NewMiscSource(nil)
 	got := m.OnMessage("motion:interrupt", `{"type":"edge","timestamp":1,"engine":"any-motion"}`)
 	if len(got) != 1 || got[0].Topic != eventbus.TopicMotionDetected {
 		t.Errorf("got %v, want [motion.detected]", topics(got))
@@ -98,12 +129,12 @@ func TestMiscMotionInterruptIsEdgeOnly(t *testing.T) {
 }
 
 func TestMiscDoesNotWatchHotHashes(t *testing.T) {
-	for _, h := range NewMiscSource().Hashes() {
+	for _, h := range NewMiscSource(nil).Hashes() {
 		if h == "motion" {
 			t.Error("the motion hash updates at 10 Hz; watch motion:interrupt instead")
 		}
 	}
-	for _, c := range NewMiscSource().Channels() {
+	for _, c := range NewMiscSource(nil).Channels() {
 		if c == "motion:sensors" || c == "motion:heading" || c == "gps:tpv" {
 			t.Errorf("channel %q is a hot source and must not be subscribed", c)
 		}
