@@ -25,21 +25,28 @@ type bound struct {
 
 	mu       sync.Mutex
 	lastFire time.Time
+
+	// cancelDebounce is the pending quiet-window timer, non-nil only while
+	// one is running. pending is the event that timer will dispatch, the most
+	// recent one seen, not the one that started the window.
+	cancelDebounce func() bool
+	pending        eventbus.Event
 }
 
 // Engine holds the compiled rules and their built sequences.
 type Engine struct {
 	bounds []*bound
 	runner *seq.Runner
+	sch    *sched.Scheduler
 	log    Logger
 }
 
 // New builds a sequence for every rule. A rule whose steps cannot be built is
 // reported and dropped; the others still run, for the same reason a bad file
 // does not stop the good ones loading. sch parks the tail of any step that
-// carries an after delay.
+// carries an after delay, and the pending timer behind any rule's debounce.
 func New(rs []*rules.Rule, pool *action.Pool, sch *sched.Scheduler, c action.Pusher, log Logger) (*Engine, []error) {
-	en := &Engine{runner: seq.NewRunner(pool, sch, log), log: log}
+	en := &Engine{runner: seq.NewRunner(pool, sch, log), sch: sch, log: log}
 	var errs []error
 
 	for _, r := range rs {
@@ -109,6 +116,10 @@ func (en *Engine) Handle(e eventbus.Event) {
 		if !ok {
 			continue
 		}
+		if b.rule.Debounce > 0 {
+			en.debounce(b, e)
+			continue
+		}
 		if !b.allow(now) {
 			continue
 		}
@@ -116,10 +127,51 @@ func (en *Engine) Handle(e eventbus.Event) {
 	}
 }
 
-// Stop abandons every in-flight sequence and refuses new ones. Call it before
-// stopping the pool, so a run cannot queue a step into a pool that is already
-// shutting down.
-func (en *Engine) Stop() { en.runner.Stop() }
+// debounce holds e as the trigger's most recent event and restarts the quiet
+// window. Cooldown is leading edge: it fires on the first event of a burst
+// and ignores the rest. Debounce is the opposite, trailing edge: nothing
+// dispatches while the source keeps re-firing, and once it has gone quiet for
+// the full window the rule fires exactly once, carrying forward whichever
+// event was most recent when the window ran out, not whichever one started
+// it. If the rule also sets a cooldown, it is checked here, against the
+// debounced dispatch itself, not against each event that only restarted the
+// window; a suppressed event never reaches it.
+func (en *Engine) debounce(b *bound, e eventbus.Event) {
+	b.mu.Lock()
+	b.pending = e
+	if b.cancelDebounce != nil {
+		b.cancelDebounce()
+	}
+	b.cancelDebounce = en.sch.At(b.rule.Debounce, func() {
+		b.mu.Lock()
+		ev := b.pending
+		b.cancelDebounce = nil
+		b.mu.Unlock()
+
+		if !b.allow(time.Now()) {
+			return
+		}
+		en.runner.Fire(b.seq, ev)
+	})
+	b.mu.Unlock()
+}
+
+// Stop abandons every in-flight sequence, refuses new ones, and drops any
+// debounce timer still waiting out its quiet window: a pending debounce is
+// exactly the kind of pending tail Stop exists to cut loose, the same as a
+// pending step wait. Call it before stopping the pool, so a run cannot queue
+// a step into a pool that is already shutting down.
+func (en *Engine) Stop() {
+	for _, b := range en.bounds {
+		b.mu.Lock()
+		if b.cancelDebounce != nil {
+			b.cancelDebounce()
+			b.cancelDebounce = nil
+		}
+		b.mu.Unlock()
+	}
+	en.runner.Stop()
+}
 
 // allow enforces the cooldown. A flapping source must not be able to fill the
 // action queue, so this is checked before Submit rather than inside the action.

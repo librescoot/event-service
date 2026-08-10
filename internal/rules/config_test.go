@@ -144,8 +144,8 @@ func TestLoadMissingDirectoryIsNotAnError(t *testing.T) {
 	}
 }
 
-// Parsed-but-unused fields (concurrency, cancel-on, repeat) must round-trip
-// into the struct so a later task can read and validate them.
+// Parsed fields (concurrency, cancel-on, repeat) must round-trip into the
+// struct so Compile can read and validate them.
 func TestLoadParsesUnusedFields(t *testing.T) {
 	dir := t.TempDir()
 	writeTOML(t, dir, "unused.toml", `
@@ -154,7 +154,7 @@ name = "with-unused"
 on   = ["x.y"]
 concurrency = "restart"
 cancel-on = ["other.event"]
-repeat = { interval = "5s" }
+repeat = { count = 3, every = "5s" }
   [[rule.step]]
   do = "redis"
   list = "l"
@@ -176,8 +176,39 @@ repeat = { interval = "5s" }
 	if len(rule.CancelOn) != 1 || rule.CancelOn[0] != "other.event" {
 		t.Errorf("CancelOn = %v, want [\"other.event\"]", rule.CancelOn)
 	}
-	if rule.Repeat == nil || rule.Repeat["interval"] != "5s" {
-		t.Errorf("Repeat = %v, want {interval: 5s}", rule.Repeat)
+	if rule.Repeat == nil || rule.Repeat.Count != 3 || rule.Repeat.Every != "5s" {
+		t.Errorf("Repeat = %+v, want {Count: 3, Every: 5s}", rule.Repeat)
+	}
+}
+
+// TestRepeatWithATypoedKeyIsALoadError is the reason Repeat is a typed struct
+// rather than map[string]any: a typed field lets md.Undecoded() see "conut"
+// as a key nothing claimed, so the whole file is rejected naming the typo. A
+// map would have absorbed it silently and the rule would have loaded with no
+// repeat at all, leaving its author believing the feature worked.
+func TestRepeatWithATypoedKeyIsALoadError(t *testing.T) {
+	dir := t.TempDir()
+	writeTOML(t, dir, "typo.toml", `
+[[rule]]
+name = "typo"
+on   = ["x.y"]
+repeat = { conut = 3 }
+  [[rule.step]]
+  do = "redis"
+  list = "l"
+  push = "p"
+`)
+
+	_, errs := Load(dir)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	msg := errs[0].Error()
+	if !strings.Contains(msg, "typo.toml") {
+		t.Errorf("error should name the file, got %q", msg)
+	}
+	if !strings.Contains(msg, "conut") {
+		t.Errorf("error should name the offending key, got %q", msg)
 	}
 }
 

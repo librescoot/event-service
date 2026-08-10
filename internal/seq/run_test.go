@@ -835,6 +835,122 @@ func TestCancelLandingMidStepDoesNotLetOneMoreStepFire(t *testing.T) {
 	}
 }
 
+// TestRepeatRunsTheWholeSequenceCountTimes fires a single-step rule with
+// repeat count 3 and checks that the step itself, not just the run, executed
+// three times: repeat runs the whole sequence again, not a bookkeeping loop
+// around a run that only ever does the work once.
+func TestRepeatRunsTheWholeSequenceCountTimes(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Repeat: &rules.RepeatConfig{Count: 3, Every: "5ms"},
+		Steps:  []rules.StepConfig{push("a", "1")},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"))
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"one", "one", "one"}) {
+		t.Errorf("steps ran as %v, want one, one, one; repeat must run the whole sequence count times", got)
+	}
+}
+
+// TestRepeatWaitsEveryBetweenIterations checks the gap goes through the
+// scheduler the same way a step's own after does: the second pass must not
+// start the instant the first one's last step finishes.
+func TestRepeatWaitsEveryBetweenIterations(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Repeat: &rules.RepeatConfig{Count: 2, Every: "100ms"},
+		Steps:  []rules.StepConfig{push("a", "1")},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"))
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "the first pass to run", func() bool { return len(rec.list()) >= 1 })
+	// A wide margin short of the 100ms gap: the second pass must not start
+	// the moment the first one's steps finish.
+	time.Sleep(20 * time.Millisecond)
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v before the gap elapsed, want only one", got)
+	}
+
+	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"one", "one"}) {
+		t.Errorf("steps ran as %v, want one, one; the second pass must still run once the gap elapses", got)
+	}
+}
+
+// TestRepeatStopsWhenCancelledMidGap uses an hour-long every so the timer
+// cannot possibly have fired by the time the cancel returns, the same
+// technique TestRunnerStopCancelsAPendingTail and TestCancelOnDropsThePendingTail
+// use for a step's own after. A repeat cancelled between passes must stop,
+// not complete its remaining passes: the gap goes through the same cancelTail
+// as a step's after, so a cancel reaching a run parked in the gap finds and
+// drops the timer through the same path.
+func TestRepeatStopsWhenCancelledMidGap(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"alarm.triggered"}, CancelOn: []string{"alarm.disarmed"},
+		Repeat: &rules.RepeatConfig{Count: 3, Every: "1h"},
+		Steps:  []rules.StepConfig{push("a", "1")},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"))
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+
+	waitFor(t, "the run to park on its repeat gap", func() bool { return sch.Pending() == 1 })
+
+	if got := rn.CancelMatching("alarm.disarmed"); got != 1 {
+		t.Errorf("CancelMatching returned %d, want 1", got)
+	}
+	if got := sch.Pending(); got != 0 {
+		t.Errorf("scheduler has %d pending fire(s) right after the cancel, want 0; a cancel mid-gap must drop the repeat timer", got)
+	}
+	if got := rn.Active(); got != 0 {
+		t.Errorf("Active() = %d after the cancel, want 0", got)
+	}
+
+	// Long enough for a second pass to have landed had the cancel not taken
+	// hold.
+	time.Sleep(30 * time.Millisecond)
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v, want only one; a repeat cancelled mid-gap must not complete its remaining passes", got)
+	}
+}
+
+// TestRepeatCountOneRunsOnePass pins the boundary the brief calls out by
+// name: count 1 is legal and means exactly one pass, with no gap parked on
+// the scheduler at all.
+func TestRepeatCountOneRunsOnePass(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Repeat: &rules.RepeatConfig{Count: 1},
+		Steps:  []rules.StepConfig{push("a", "1")},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"))
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v, want only one; count 1 means one pass", got)
+	}
+	if got := sch.Pending(); got != 0 {
+		t.Errorf("scheduler has %d pending fire(s) after a count-1 repeat, want 0; there is no gap to wait for", got)
+	}
+}
+
 func TestNegativeAfterIsRejectedAtCompileTimeNamingTheStep(t *testing.T) {
 	_, errs := rules.Compile([]rules.RuleConfig{{
 		Name: "r", On: []string{"x.y"},

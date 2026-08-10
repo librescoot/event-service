@@ -23,18 +23,22 @@ type Logger interface {
 }
 
 // run is one walk over a sequence's steps. step is the index of the next step
-// to claim, and ended marks a run that must not move any further. cancelTail
-// holds the scheduler cancel for a step currently parked on a timer; it is
-// nil whenever the run is not waiting out an after.
+// to claim within the current pass. pass is how many complete passes ran
+// before this one; a rule with no repeat never moves it off zero. ended marks
+// a run that must not move any further. cancelTail holds the scheduler cancel
+// for whatever this run is currently parked on, a step's own after or the gap
+// between one repeat pass and the next; it is nil whenever the run is not
+// waiting on a timer.
 //
-// All three fields are guarded by the Runner's mutex: a run starts on the bus
+// All fields are guarded by the Runner's mutex: a run starts on the bus
 // subscriber goroutine and then moves forward on whichever pool worker
 // finished the previous step, or on the scheduler's own goroutine once a
-// parked step's timer fires.
+// parked timer fires.
 type run struct {
 	seq        *Sequence
 	event      eventbus.Event
 	step       int
+	pass       int
 	ended      bool
 	cancelTail func() bool
 }
@@ -160,11 +164,13 @@ func (rn *Runner) CancelMatching(topic string) int {
 	return n
 }
 
-// advance claims the step the run is sitting on, or ends the run if none are
-// left. It is the single place a run's step index moves forward: Fire calls
-// it to start a run, a step's completion callback calls it for the step
-// after, and a parked step's timer fire reaches it indirectly, through
-// runStep rather than a second call to advance, once its delay has elapsed.
+// advance claims the step the run is sitting on within its current pass, or
+// hands off to finishPass once the pass is out of steps. It is the place a
+// run's step index moves forward: Fire calls it to start a run, a step's
+// completion callback calls it for the step after, a parked step's timer fire
+// reaches it indirectly through runStep once its delay has elapsed, and a
+// repeat gap's timer fire calls it directly to start the next pass from step
+// zero.
 func (rn *Runner) advance(r *run) {
 	rn.mu.Lock()
 	if r.ended || rn.stopped {
@@ -181,7 +187,7 @@ func (rn *Runner) advance(r *run) {
 	rn.mu.Unlock()
 
 	if idx >= len(r.seq.Steps) {
-		rn.end(r)
+		rn.finishPass(r)
 		return
 	}
 	step := r.seq.Steps[idx]
@@ -192,6 +198,42 @@ func (rn *Runner) advance(r *run) {
 	}
 
 	rn.runStep(r, idx, step)
+}
+
+// finishPass is reached once every step of one pass has been claimed. A rule
+// with no repeat, or one whose passes are used up, ends here like any other
+// run out of steps. A rule with passes left instead parks the gap before the
+// next one on the scheduler, exactly the way a step's own after parks, so the
+// wait holds no worker; the cancel goes into the same cancelTail field a
+// step's after uses, so a cancel or a Stop reaching a run sitting in the gap
+// finds and drops the timer through the same path endLocked already handles
+// for every other pending tail. The next pass starts from the sequence's
+// first step once the gap elapses.
+func (rn *Runner) finishPass(r *run) {
+	rn.mu.Lock()
+	if r.ended || rn.stopped {
+		rn.mu.Unlock()
+		return
+	}
+	rep := r.seq.Rule.Repeat
+	if rep == nil || r.pass+1 >= rep.Count {
+		rn.mu.Unlock()
+		rn.end(r)
+		return
+	}
+	r.pass++
+	r.step = 0
+	r.cancelTail = rn.sch.At(rep.Every, func() {
+		rn.mu.Lock()
+		if r.ended || rn.stopped {
+			rn.mu.Unlock()
+			return
+		}
+		r.cancelTail = nil
+		rn.mu.Unlock()
+		rn.advance(r)
+	})
+	rn.mu.Unlock()
 }
 
 // deferStep parks step on the scheduler and returns without submitting
@@ -359,8 +401,9 @@ func (rn *Runner) startQueuedLocked(name string) *run {
 }
 
 // Active is how many runs are part-way through their steps, including a run
-// currently parked on a timer waiting out an after. A trigger sitting in a
-// queue-policy rule's backlog is not active: it has not started.
+// currently parked on a timer waiting out an after or the gap between two
+// repeat passes. A trigger sitting in a queue-policy rule's backlog is not
+// active: it has not started.
 func (rn *Runner) Active() int {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()

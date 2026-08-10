@@ -20,15 +20,15 @@ type Config struct {
 // RuleConfig is one [[rule]] block as written on disk. It is the wire format,
 // not the runtime shape: Compile turns it into a Rule.
 type RuleConfig struct {
-	Name        string         `toml:"name"`
-	On          []string       `toml:"on"`
-	When        string         `toml:"when"`
-	Cooldown    string         `toml:"cooldown"`
-	Enabled     *bool          `toml:"enabled"`
-	Steps       []StepConfig   `toml:"step"`
-	Concurrency string         `toml:"concurrency"`
-	CancelOn    []string       `toml:"cancel-on"`
-	Repeat      map[string]any `toml:"repeat"`
+	Name        string        `toml:"name"`
+	On          []string      `toml:"on"`
+	When        string        `toml:"when"`
+	Cooldown    string        `toml:"cooldown"`
+	Enabled     *bool         `toml:"enabled"`
+	Steps       []StepConfig  `toml:"step"`
+	Concurrency string        `toml:"concurrency"`
+	CancelOn    []string      `toml:"cancel-on"`
+	Repeat      *RepeatConfig `toml:"repeat"`
 
 	// Debounce is a pointer because a duration has no nil of its own, and
 	// Compile has to tell "debounce was never written" from "debounce was
@@ -40,6 +40,16 @@ type RuleConfig struct {
 	// Source names the file this rule came from, so an error message can tell
 	// the user which of their files to go and fix.
 	Source string `toml:"-"`
+}
+
+// RepeatConfig is the wire format of a rule's repeat key. It is a typed
+// struct rather than map[string]any so that a typo like repeat = { conut = 3
+// } is a load error naming the file: Load's md.Undecoded() check only sees an
+// unclaimed key when the destination is a struct field it can fail to find, a
+// map absorbs anything written into it with no trace of what was meant.
+type RepeatConfig struct {
+	Count int    `toml:"count"`
+	Every string `toml:"every"`
 }
 
 // StepConfig is one [[rule.step]] block. The fields are a union across action

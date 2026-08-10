@@ -424,58 +424,116 @@ func TestCancelledByMatchesExactTopicsAndGlobs(t *testing.T) {
 	}
 }
 
-func TestCompileRejectsRepeat(t *testing.T) {
-	_, errs := Compile([]RuleConfig{{
-		Name: "r", On: []string{"x.y"}, Repeat: map[string]any{"every": "5s"}, Steps: []StepConfig{redisStep()},
-	}}, noState)
-	if len(errs) != 1 {
-		t.Fatalf("got %d errors, want 1", len(errs))
+func TestCompileParsesRepeat(t *testing.T) {
+	r := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Repeat: &RepeatConfig{Count: 3, Every: "700ms"},
+		Steps:  []StepConfig{redisStep()},
+	}, noState)
+	if r.Repeat == nil {
+		t.Fatal("Repeat should be set")
 	}
-	if !strings.Contains(errs[0].Error(), "not supported yet") {
-		t.Errorf("error should name the limitation, got %v", errs[0])
+	if r.Repeat.Count != 3 {
+		t.Errorf("Repeat.Count = %d, want 3", r.Repeat.Count)
+	}
+	if r.Repeat.Every != 700*time.Millisecond {
+		t.Errorf("Repeat.Every = %v, want 700ms", r.Repeat.Every)
 	}
 }
 
-func TestCompileRejectsDebounce(t *testing.T) {
-	d := "500ms"
+// TestCompileAllowsRepeatCountOfOneWithoutEvery is the boundary the brief
+// calls out by name: count = 1 is a legal repeat, meaning one pass, and since
+// there is no gap to wait between a single pass and itself, every is not
+// required or checked.
+func TestCompileAllowsRepeatCountOfOneWithoutEvery(t *testing.T) {
+	r := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Repeat: &RepeatConfig{Count: 1},
+		Steps:  []StepConfig{redisStep()},
+	}, noState)
+	if r.Repeat == nil || r.Repeat.Count != 1 {
+		t.Fatalf("Repeat = %+v, want Count 1", r.Repeat)
+	}
+}
+
+// TestCompileRejectsRepeatCountBelowOne also covers repeat = {}: an empty
+// table decodes to a non-nil RepeatConfig with Count at its Go zero value, 0,
+// which is exactly the value this check rejects. A rule author who wrote the
+// key at all meant to use the feature, so an empty table gets the same
+// rejection as any other invalid count rather than being read as "no repeat".
+func TestCompileRejectsRepeatCountBelowOne(t *testing.T) {
 	_, errs := Compile([]RuleConfig{{
+		Name: "r", Source: "horn.toml", On: []string{"x.y"},
+		Repeat: &RepeatConfig{},
+		Steps:  []StepConfig{redisStep()},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	msg := errs[0].Error()
+	for _, want := range []string{`"r"`, "horn.toml", "count"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should mention %s, got %q", want, msg)
+		}
+	}
+}
+
+func TestCompileRejectsRepeatWithZeroEveryWhenCountAboveOne(t *testing.T) {
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", On: []string{"x.y"},
+		Repeat: &RepeatConfig{Count: 3},
+		Steps:  []StepConfig{redisStep()},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	if !strings.Contains(errs[0].Error(), "every") {
+		t.Errorf("error should name every, got %v", errs[0])
+	}
+}
+
+func TestCompileRejectsRepeatWithNegativeEveryWhenCountAboveOne(t *testing.T) {
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", On: []string{"x.y"},
+		Repeat: &RepeatConfig{Count: 3, Every: "-1s"},
+		Steps:  []StepConfig{redisStep()},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	if !strings.Contains(errs[0].Error(), "every") {
+		t.Errorf("error should name every, got %v", errs[0])
+	}
+}
+
+func TestCompileParsesDebounce(t *testing.T) {
+	d := "300ms"
+	r := mustCompileOne(t, RuleConfig{
 		Name: "r", On: []string{"x.y"}, Debounce: &d, Steps: []StepConfig{redisStep()},
-	}}, noState)
-	if len(errs) != 1 {
-		t.Fatalf("got %d errors, want 1", len(errs))
-	}
-	if !strings.Contains(errs[0].Error(), "not supported yet") {
-		t.Errorf("error should name the limitation, got %v", errs[0])
+	}, noState)
+	if r.Debounce != 300*time.Millisecond {
+		t.Errorf("Debounce = %v, want 300ms", r.Debounce)
 	}
 }
 
-// The two tests below guard finding 8: an empty spelling of an unsupported
-// feature (an empty table, a zero duration) must be rejected exactly like its
-// non-empty form. Both parse to the same Go zero value as an omitted key, so
-// a check that looks at truthiness instead of presence would let them through
-// unnoticed.
-
-func TestCompileRejectsEmptyRepeat(t *testing.T) {
-	_, errs := Compile([]RuleConfig{{
-		Name: "r", On: []string{"x.y"}, Repeat: map[string]any{}, Steps: []StepConfig{redisStep()},
-	}}, noState)
-	if len(errs) != 1 {
-		t.Fatalf("got %d errors, want 1", len(errs))
-	}
-	if !strings.Contains(errs[0].Error(), "not supported yet") {
-		t.Errorf("error should name the limitation, got %v", errs[0])
-	}
-}
-
-func TestCompileRejectsZeroDebounce(t *testing.T) {
+// TestCompileRejectsZeroDebounceNamingTheRule is why Debounce stays a pointer
+// even now that the feature works: a duration has no nil of its own, so
+// "debounce was never written" and "debounce was written as 0s" both parse to
+// the same zero time.Duration and only the pointer tells them apart. Only the
+// latter is a rule author believing a no-op holds a fire, so it is rejected
+// rather than silently treated the same as an omitted key.
+func TestCompileRejectsZeroDebounceNamingTheRule(t *testing.T) {
 	d := "0s"
 	_, errs := Compile([]RuleConfig{{
-		Name: "r", On: []string{"x.y"}, Debounce: &d, Steps: []StepConfig{redisStep()},
+		Name: "r", Source: "horn.toml", On: []string{"x.y"}, Debounce: &d, Steps: []StepConfig{redisStep()},
 	}}, noState)
 	if len(errs) != 1 {
-		t.Fatalf("got %d errors, want 1", len(errs))
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
 	}
-	if !strings.Contains(errs[0].Error(), "not supported yet") {
-		t.Errorf("error should name the limitation, got %v", errs[0])
+	msg := errs[0].Error()
+	for _, want := range []string{`"r"`, "horn.toml"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should mention %s, got %q", want, msg)
+		}
 	}
 }

@@ -41,10 +41,21 @@ type Rule struct {
 	CancelOn    []string
 	Concurrency Policy
 	Cooldown    time.Duration
+	Repeat      *Repeat
+	Debounce    time.Duration
 	Steps       []Step
 
 	program *vm.Program
 	state   StateFunc
+}
+
+// Repeat runs a rule's whole step sequence more than once. Count is always at
+// least 1. Every is the gap between one pass finishing and the next
+// starting; it only means anything, and is only required to be positive,
+// once Count is greater than 1, since a single pass has no gap to wait out.
+type Repeat struct {
+	Count int
+	Every time.Duration
 }
 
 // Step is one step of a rule. Config holds the fields the action is built
@@ -105,17 +116,6 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 	if len(c.Steps) == 0 {
 		return nil, fmt.Errorf("missing step")
 	}
-	// Presence, not truthiness: repeat = {} decodes to a non-nil, zero-length
-	// value, distinguishable from an omitted key by nil-ness alone. A rule
-	// author who wrote it meant to use the feature and must see the same
-	// rejection as the non-empty form.
-	if c.Repeat != nil {
-		return nil, fmt.Errorf("repeat is not supported yet")
-	}
-	if c.Debounce != nil {
-		return nil, fmt.Errorf("debounce is not supported yet")
-	}
-
 	policy, err := parsePolicy(c.Concurrency)
 	if err != nil {
 		return nil, err
@@ -133,6 +133,42 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 
 	if r.Cooldown, err = parseDuration(c.Cooldown); err != nil {
 		return nil, fmt.Errorf("cooldown: %w", err)
+	}
+
+	// Presence, not truthiness: repeat = {} decodes to a non-nil RepeatConfig
+	// with Count at its Go zero value, 0, which the count check below rejects
+	// the same as any other invalid count. A rule author who wrote the key at
+	// all meant to use the feature, so an empty table does not read as "no
+	// repeat".
+	if c.Repeat != nil {
+		if c.Repeat.Count < 1 {
+			return nil, fmt.Errorf("repeat: count must be at least 1")
+		}
+		every, err := parseDuration(c.Repeat.Every)
+		if err != nil {
+			return nil, fmt.Errorf("repeat: every: %w", err)
+		}
+		if c.Repeat.Count > 1 && every <= 0 {
+			return nil, fmt.Errorf("repeat: every must be positive when count is greater than 1")
+		}
+		r.Repeat = &Repeat{Count: c.Repeat.Count, Every: every}
+	}
+
+	// Debounce is a pointer because a duration has no nil of its own, and this
+	// has to tell "debounce was never written" from "debounce was written as
+	// an empty duration like 0s": both parse to the same zero time.Duration,
+	// but only the latter is a rule author believing a no-op holds a fire
+	// rather than silence. A zero or negative debounce is rejected the same
+	// way; an omitted debounce is left alone.
+	if c.Debounce != nil {
+		d, err := parseDuration(*c.Debounce)
+		if err != nil {
+			return nil, fmt.Errorf("debounce: %w", err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("debounce must be positive")
+		}
+		r.Debounce = d
 	}
 
 	if c.When != "" {

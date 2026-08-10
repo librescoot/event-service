@@ -346,6 +346,157 @@ func TestCancelIsAppliedBeforeMatching(t *testing.T) {
 	}
 }
 
+// countPushed counts the pushes recorded against one list, so a test running
+// two rules side by side on the same recordingPusher can tell them apart.
+func countPushed(p *recordingPusher, list string) int {
+	n := 0
+	prefix := list + "="
+	for _, s := range p.list() {
+		if strings.HasPrefix(s, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestDebounceDispatchesOnceAfterTheSourceGoesQuiet fires a flapping source
+// with no pause longer than the debounce window and checks nothing dispatches
+// until the flapping actually stops.
+func TestDebounceDispatchesOnceAfterTheSourceGoesQuiet(t *testing.T) {
+	p := &countingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	d := "50ms"
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"motion.detected"}, Debounce: &d, Steps: []rules.StepConfig{horn()},
+	})
+	en, _ := New(rs, pool, testSched(t), p, nopLog{})
+	defer en.Stop()
+
+	for i := 0; i < 5; i++ {
+		en.Handle(eventbus.Event{Topic: "motion.detected"})
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := p.count(); got != 0 {
+		t.Errorf("dispatched %d times while the source was still flapping, want 0; debounce must hold the fire", got)
+	}
+
+	waitFor(t, func() bool { return p.count() >= 1 })
+	time.Sleep(80 * time.Millisecond)
+	if got := p.count(); got != 1 {
+		t.Errorf("fired %d times once the source went quiet, want 1", got)
+	}
+}
+
+// TestDebounceCarriesTheMostRecentEventNotTheFirst fires three events with
+// different data.n values inside one debounce window. The step's own when
+// only lets the push through for the last one, n == 3: if the runner carried
+// the first event forward instead, as a reader might guess, the when would
+// see n == 1 and the run would end without ever pushing.
+func TestDebounceCarriesTheMostRecentEventNotTheFirst(t *testing.T) {
+	p := &recordingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	d := "30ms"
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"motion.detected"}, Debounce: &d,
+		Steps: []rules.StepConfig{
+			{Do: "redis", List: "scooter:horn", Push: "on", When: `data.n == 3`},
+		},
+	})
+	en, _ := New(rs, pool, testSched(t), p, nopLog{})
+	defer en.Stop()
+
+	for n := 1; n <= 3; n++ {
+		en.Handle(eventbus.Event{Topic: "motion.detected", Data: map[string]any{"n": n}})
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	waitFor(t, func() bool { return len(p.list()) >= 1 })
+	time.Sleep(60 * time.Millisecond)
+	if got := len(p.list()); got != 1 {
+		t.Errorf("dispatched %d times, want 1; the debounced dispatch should see the last event's data", got)
+	}
+}
+
+// TestDebounceIsDistinctFromCooldown puts a cooldown rule and a debounce rule
+// on the same flapping source side by side. Cooldown is leading edge: it
+// fires the instant the first event lands and then ignores the rest.
+// Debounce is the opposite, trailing edge: it fires nothing while the source
+// keeps flapping and dispatches once, late, after the flapping stops. The two
+// rules see the exact same events and must diverge.
+func TestDebounceIsDistinctFromCooldown(t *testing.T) {
+	p := &recordingPusher{}
+	pool := action.NewPool(2, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	d := "60ms"
+	rs := compileRules(t,
+		rules.RuleConfig{
+			Name: "cooldown-rule", On: []string{"motion.detected"}, Cooldown: "10s",
+			Steps: []rules.StepConfig{{Do: "redis", List: "cooldown", Push: "fired"}},
+		},
+		rules.RuleConfig{
+			Name: "debounce-rule", On: []string{"motion.detected"}, Debounce: &d,
+			Steps: []rules.StepConfig{{Do: "redis", List: "debounce", Push: "fired"}},
+		},
+	)
+	en, _ := New(rs, pool, testSched(t), p, nopLog{})
+	defer en.Stop()
+
+	for i := 0; i < 4; i++ {
+		en.Handle(eventbus.Event{Topic: "motion.detected"})
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	waitFor(t, func() bool { return countPushed(p, "cooldown") >= 1 })
+	if got := countPushed(p, "cooldown"); got != 1 {
+		t.Errorf("cooldown pushed %d times during the flap, want 1; cooldown fires on the leading edge", got)
+	}
+	if got := countPushed(p, "debounce"); got != 0 {
+		t.Errorf("debounce pushed %d times during the flap, want 0; debounce must not fire on the leading edge", got)
+	}
+
+	waitFor(t, func() bool { return countPushed(p, "debounce") >= 1 })
+	if got := countPushed(p, "debounce"); got != 1 {
+		t.Errorf("debounce pushed %d times, want 1", got)
+	}
+}
+
+// TestPendingDebounceIsDroppedOnShutdown mirrors
+// TestRunnerStopCancelsAPendingTail: Pending is checked immediately after
+// Stop, with no sleep in between, so the empty registry can only be Stop's
+// own cancel and not the timer's self-removal on fire.
+func TestPendingDebounceIsDroppedOnShutdown(t *testing.T) {
+	p := &countingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	d := "1h"
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"motion.detected"}, Debounce: &d, Steps: []rules.StepConfig{horn()},
+	})
+	sch := testSched(t)
+	en, _ := New(rs, pool, sch, p, nopLog{})
+
+	en.Handle(eventbus.Event{Topic: "motion.detected"})
+	waitFor(t, func() bool { return sch.Pending() == 1 })
+
+	en.Stop()
+	if got := sch.Pending(); got != 0 {
+		t.Errorf("scheduler has %d pending fire(s) right after Stop, want 0; shutdown must drop a pending debounce timer", got)
+	}
+	if got := p.count(); got != 0 {
+		t.Errorf("dispatched %d times after Stop, want 0", got)
+	}
+}
+
 func TestNewReportsUnbuildableRuleWithoutLosingTheRest(t *testing.T) {
 	rs := compileRules(t,
 		rules.RuleConfig{Name: "good", On: []string{"x.y"}, Steps: []rules.StepConfig{horn()}},
