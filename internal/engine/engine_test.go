@@ -615,3 +615,39 @@ func TestNewErrorNamesRuleFileAndStepTogether(t *testing.T) {
 		}
 	}
 }
+
+// TestDebounceStillRespectsCooldown puts both keys on one rule. Debounce holds
+// the fire until the source goes quiet; the cooldown is then measured against
+// that dispatch, not against the events that only restarted the window. A rule
+// carrying both must therefore fire once per cooldown however often the source
+// goes quiet, and a debounce that skips the cooldown check would fire on every
+// pause instead.
+func TestDebounceStillRespectsCooldown(t *testing.T) {
+	p := &countingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	d := "20ms"
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"motion.detected"}, Debounce: &d, Cooldown: "10s",
+		Steps: []rules.StepConfig{horn()},
+	})
+	en, errs := New(rs, pool, testSched(t), nil, p, nopLog{})
+	if len(errs) != 0 {
+		t.Fatalf("New: %v", errs)
+	}
+	defer en.Stop()
+
+	en.Handle(eventbus.Event{Topic: "motion.detected"})
+	waitFor(t, func() bool { return p.count() == 1 })
+
+	// A second quiet window, well inside a ten second cooldown. The wait is
+	// several times the debounce, so a dispatch that was going to happen has
+	// happened by the time it is checked.
+	en.Handle(eventbus.Event{Topic: "motion.detected"})
+	time.Sleep(150 * time.Millisecond)
+	if got := p.count(); got != 1 {
+		t.Errorf("dispatched %d times inside a 10s cooldown, want 1; the debounced fire is what the cooldown counts", got)
+	}
+}

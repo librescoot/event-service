@@ -40,12 +40,11 @@ func TestCancelPreventsFire(t *testing.T) {
 // At these timings the Go runtime already serialises Stop against a fresh
 // AfterFunc timer's own fire internally, so this loop passes even against
 // an implementation that drops the atomic claim and relies only on
-// Timer.Stop()'s return value. It cannot by itself prove the claim is
-// doing anything. The claim in sched.go stays regardless, because it does
-// not depend on that unstated runtime behaviour holding at other timings
-// or in future Go versions; this test just cannot discriminate the two
-// designs, and a test built to force that discrimination would depend on
-// runtime timing internals and be flaky.
+// Timer.Stop()'s return value. It cannot by itself prove the claim is doing
+// anything, and it is not the test that does:
+// TestAClaimedEntryDoesNotFireWhenItsTimerLandsAnyway reaches the window
+// directly instead of waiting for the runtime to hand it over. What this one
+// covers is the ordinary race, end to end, at timings a rule actually meets.
 func TestCancelRacingFireRunsFnAtMostOnce(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		s := New()
@@ -104,4 +103,40 @@ func TestFiredEntryIsRemoved(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("Pending() = %d after fire, want 0", s.Pending())
+}
+
+// TestAClaimedEntryDoesNotFireWhenItsTimerLandsAnyway pins the claim on the
+// fire side. A cancel arriving after AfterFunc has already been triggered
+// cannot take the fire back through Timer.Stop, which returns false and does
+// nothing; the claim is the only thing between that cancel and fn running
+// anyway, and a cancel that reported it prevented the fire while the fire
+// happened is a run that is both cancelled and still advancing.
+//
+// The entry is claimed here the way that cancel claims it, and its timer is
+// deliberately left running, so the window is reached without racing the
+// runtime for it.
+func TestAClaimedEntryDoesNotFireWhenItsTimerLandsAnyway(t *testing.T) {
+	s := New()
+	defer s.Stop()
+
+	var n atomic.Int32
+	s.At(20*time.Millisecond, func() { n.Add(1) })
+
+	s.mu.Lock()
+	var e *entry
+	for _, v := range s.entries {
+		e = v
+	}
+	s.mu.Unlock()
+	if e == nil {
+		t.Fatal("the scheduled entry is not in the registry")
+	}
+	if !e.claimed.CompareAndSwap(false, true) {
+		t.Fatal("the entry was already claimed before the test claimed it")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if got := n.Load(); got != 0 {
+		t.Fatalf("fn ran %d time(s) after its entry was claimed, want 0", got)
+	}
 }
