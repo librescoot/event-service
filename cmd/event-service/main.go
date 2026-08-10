@@ -24,6 +24,30 @@ import (
 
 var version = "dev"
 
+// buildSnapshot builds the counter map published to the extensions hash.
+// dropped and refused are kept apart on purpose: dropped is action.Pool
+// turning away work because its queue is full or it is stopping, the lever
+// for which is --workers or --queue, while refused is one rule's own
+// concurrency backlog saturating, the lever for which is inside that rule's
+// sequence. Merging them into one number would hide which of two unrelated
+// problems an operator is looking at.
+//
+// Pulled out of main so its field mapping has something other than main
+// itself to exercise it: main is not otherwise reached by the test suite.
+func buildSnapshot(pool *action.Pool, sch *sched.Scheduler, en *engine.Engine, version string) map[string]string {
+	ps := pool.Stats()
+	return map[string]string{
+		"rules":       strconv.Itoa(en.RuleCount()),
+		"dispatched":  strconv.FormatUint(ps.Dispatched, 10),
+		"dropped":     strconv.FormatUint(ps.Dropped, 10),
+		"refused":     strconv.FormatUint(en.Refused(), 10),
+		"failed":      strconv.FormatUint(ps.Failed, 10),
+		"pending":     strconv.Itoa(sch.Pending()),
+		"runs-active": strconv.Itoa(en.Active()),
+		"version":     version,
+	}
+}
+
 func main() {
 	var (
 		redisAddr = flag.String("redis", "localhost:6379", "datastore address")
@@ -109,16 +133,7 @@ func main() {
 	// TODO(task 9): promote this literal to a --stats-interval flag.
 	statsPub := stats.NewPublisher(client, 10*time.Second, log.Default())
 	statsPub.Start(func() map[string]string {
-		ps := pool.Stats()
-		return map[string]string{
-			"rules":       strconv.Itoa(en.RuleCount()),
-			"dispatched":  strconv.FormatUint(ps.Dispatched, 10),
-			"dropped":     strconv.FormatUint(ps.Dropped+en.Refused(), 10),
-			"failed":      strconv.FormatUint(ps.Failed, 10),
-			"pending":     strconv.Itoa(sch.Pending()),
-			"runs-active": strconv.Itoa(en.Active()),
-			"version":     version,
-		}
+		return buildSnapshot(pool, sch, en, version)
 	})
 	defer statsPub.Stop()
 
