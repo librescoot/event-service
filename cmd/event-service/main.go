@@ -195,10 +195,10 @@ func main() {
 	<-sig
 	log.Printf("shutting down")
 
-	// Shutdown is one ordered list rather than a stack of defers: the order is
-	// the point, and reading it out of a LIFO stack spread over sixty lines is
-	// how it came to be wrong in the first place. Each line below is what the
-	// line after it needs to have happened already.
+	// Shutdown is one ordered list rather than a stack of defers, because the
+	// order is the point and a LIFO stack spread over sixty lines does not
+	// show it. Each line below is what the line after it needs to have
+	// happened already.
 	//
 	// The bus closes first, so nothing new can start a run. The engine then
 	// abandons the runs that are in flight, cutting loose every pending tail
