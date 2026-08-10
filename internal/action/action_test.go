@@ -40,6 +40,34 @@ func (f *fakeAction) count() int {
 	return f.calls
 }
 
+// releaser returns the channel a pinned worker waits on and the function that
+// lets it go. Releasing twice is safe, so a test can defer the release and
+// still call it at the point it means to.
+//
+// A pinned worker must always wait on this channel together with the action's
+// own context, never on this channel alone. t.Fatal runs runtime.Goexit, and
+// whether the release still happens after that comes down to defer against
+// cleanup ordering that a later edit can invert without noticing: a deferred
+// p.Stop() registered after a deferred release runs first, and waits for the
+// worker that the release it beat was going to free. Selecting on the context
+// as well makes Pool.Stop itself the thing that frees the worker, and that
+// holds however the two are ordered.
+func releaser() (<-chan struct{}, func()) {
+	ch := make(chan struct{})
+	return ch, sync.OnceFunc(func() { close(ch) })
+}
+
+// awaitSignal waits for ch to be closed, and says which signal never arrived
+// rather than letting the test hang until the package deadline.
+func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
 func TestPoolRunsSubmittedActions(t *testing.T) {
 	p := NewPool(2, 8, nopLog{})
 	p.Start()
@@ -118,7 +146,8 @@ func TestPoolCountsFailures(t *testing.T) {
 
 func TestPoolStopWaitsForInFlightWork(t *testing.T) {
 	started := make(chan struct{})
-	release := make(chan struct{})
+	release, letGo := releaser()
+	defer letGo()
 	p := NewPool(1, 4, nopLog{})
 	p.Start()
 
@@ -126,15 +155,18 @@ func TestPoolStopWaitsForInFlightWork(t *testing.T) {
 	var mu sync.Mutex
 	p.Submit(actionFunc(func(ctx context.Context, e eventbus.Event) error {
 		close(started)
-		<-release
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
 		mu.Lock()
 		finished = true
 		mu.Unlock()
 		return nil
 	}), eventbus.Event{Topic: "x.y"}, "r", nil)
 
-	<-started
-	close(release)
+	awaitSignal(t, started, "the job to reach a worker")
+	letGo()
 	p.Stop()
 
 	mu.Lock()
@@ -181,7 +213,7 @@ func TestStopCancelsRunningActionsContext(t *testing.T) {
 		return ctx.Err()
 	}), eventbus.Event{Topic: "x.y"}, "r", nil)
 
-	<-started
+	awaitSignal(t, started, "the job to reach a worker")
 
 	stopReturned := make(chan struct{})
 	go func() {
@@ -202,22 +234,28 @@ func TestStopCancelsRunningActionsContext(t *testing.T) {
 
 // TestStopCountsAbandonedQueuedJobsAsDropped proves that jobs still sitting
 // in the queue when every worker has exited are counted into Dropped, not
-// silently discarded. The sole worker is pinned on a job that ignores ctx
-// (representative of an action that does not itself watch for cancellation),
-// so the three jobs behind it in the queue are never dispatched.
+// silently discarded.
+//
+// The sole worker is pinned on the context Stop cancels, which puts the
+// release exactly where it needs to be with nothing to time: the worker is
+// held until Stop has signalled the workers to leave, and it is that same
+// signal that frees it, so it goes out through its own done pre-check rather
+// than draining the three jobs queued behind it. It also means every
+// assertion here is free to fail without stranding a worker, since the
+// deferred Stop is what unpins it.
 func TestStopCountsAbandonedQueuedJobsAsDropped(t *testing.T) {
 	started := make(chan struct{})
-	release := make(chan struct{})
 
 	p := NewPool(1, 4, nopLog{})
 	p.Start()
+	defer p.Stop()
 
 	p.Submit(actionFunc(func(ctx context.Context, e eventbus.Event) error {
 		close(started)
-		<-release
+		<-ctx.Done()
 		return nil
 	}), eventbus.Event{Topic: "x.y"}, "r", nil)
-	<-started
+	awaitSignal(t, started, "the pinning job to reach the worker")
 
 	noop := actionFunc(func(ctx context.Context, e eventbus.Event) error { return nil })
 	for i := 0; i < 3; i++ {
@@ -231,30 +269,7 @@ func TestStopCountsAbandonedQueuedJobsAsDropped(t *testing.T) {
 		p.Stop()
 		close(stopReturned)
 	}()
-
-	// Wait for Stop to have signalled done before releasing the pinned
-	// worker, so the worker's done pre-check sees a pool that is already
-	// stopping and does not go on to drain the queue.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		select {
-		case <-p.done:
-		default:
-			if time.Now().After(deadline) {
-				t.Fatal("Stop never signalled done")
-			}
-			time.Sleep(time.Millisecond)
-			continue
-		}
-		break
-	}
-	close(release)
-
-	select {
-	case <-stopReturned:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Stop did not return")
-	}
+	awaitSignal(t, stopReturned, "Stop to return")
 
 	if s := p.Stats(); s.Dropped != 3 {
 		t.Errorf("Dropped = %d, want 3 abandoned queued jobs", s.Dropped)
