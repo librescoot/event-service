@@ -66,8 +66,20 @@ func Compile(cfgs []RuleConfig, lookup StateFunc) ([]*Rule, []error) {
 	var out []*Rule
 	var errs []error
 
+	// A name is the handle everything acting on a whole rule uses: the runner
+	// groups runs under it, so two rules sharing one would share a concurrency
+	// policy, a cancel-on list and a queue, and each would cancel and restart
+	// the other's runs. Copying a rule file to try a variant and leaving the
+	// name as it was is an easy mistake to make and a near-invisible one to
+	// debug, so the second definition is a load error naming both files.
+	source := make(map[string]string, len(cfgs))
+
 	for _, c := range cfgs {
 		if c.Enabled != nil && !*c.Enabled {
+			continue
+		}
+		if first, taken := source[c.Name]; taken {
+			errs = append(errs, fmt.Errorf("rule %q in %s: duplicate name, already defined in %s", c.Name, c.Source, first))
 			continue
 		}
 		r, err := compileOne(c, lookup)
@@ -75,6 +87,9 @@ func Compile(cfgs []RuleConfig, lookup StateFunc) ([]*Rule, []error) {
 			errs = append(errs, fmt.Errorf("rule %q in %s: %w", c.Name, c.Source, err))
 			continue
 		}
+		// Claimed only once the rule really loaded, so a name a broken rule
+		// mentioned is still free for a working one.
+		source[c.Name] = c.Source
 		out = append(out, r)
 	}
 	return out, errs

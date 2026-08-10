@@ -94,10 +94,19 @@ before matching, so a single event can cancel one rule and fire another, which
 is how "blink the hazards, stop 30s later" is made to stop early when the
 rider disarms at second five.
 
-A step that is already executing when the cancel arrives is **not**
-interrupted. The worker owns it and runs it to its end; a `redis` push or an
-`exec` command in flight will complete. What cancelling guarantees is that
-nothing after that step runs.
+A step that has already been handed to the worker pool when the cancel arrives
+is **not** interrupted, and that covers both a step a worker is running and one
+still waiting its turn in the pool's queue. A `redis` push or an `exec` command
+already accepted will complete. What cancelling guarantees is that nothing
+after that step runs.
+
+A rule's `name` must be unique across every file in the directory. It is the
+handle a rule's runs are grouped under, so two rules sharing one would share a
+concurrency policy, a cancel-on list and a queue, and either could cancel the
+other's runs on a topic it never mentions. The second definition fails to load
+with an error naming both files; the first still loads, as does everything
+else. A disabled rule holds no name, so keeping the old copy around with
+`enabled = false` while a variant is tried works as expected.
 
 Not supported yet: `repeat`, `debounce`, and the `can`, `lua`, and `http` step
 kinds. A rule using any of these fails to load rather than silently doing

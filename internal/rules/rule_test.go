@@ -122,6 +122,71 @@ func TestCompileRejectsMissingName(t *testing.T) {
 	}
 }
 
+// TestCompileRejectsADuplicateRuleNameNamingBothFiles covers the mistake this
+// check exists for: copying hazards.toml to hazards-v2.toml to try a variant
+// and leaving the name inside as it was. Both definitions would then share a
+// concurrency policy, a cancel-on list and a queue, and one would cancel the
+// other's runs on a topic it never mentions. The error has to name both files
+// or the user has one name and nowhere to look.
+func TestCompileRejectsADuplicateRuleNameNamingBothFiles(t *testing.T) {
+	rs, errs := Compile([]RuleConfig{
+		{Name: "hazards", Source: "hazards.toml", On: []string{"alarm.triggered"}, Steps: []StepConfig{redisStep()}},
+		{Name: "hazards", Source: "hazards-v2.toml", On: []string{"alarm.triggered"}, Steps: []StepConfig{redisStep()}},
+		{Name: "chirp", Source: "chirp.toml", On: []string{"alarm.disarmed"}, Steps: []StepConfig{redisStep()}},
+	}, noState)
+
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	msg := errs[0].Error()
+	for _, want := range []string{`"hazards"`, "hazards.toml", "hazards-v2.toml"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should mention %s, got %q", want, msg)
+		}
+	}
+
+	if len(rs) != 2 {
+		t.Fatalf("got %d rules, want 2; the first definition and the unrelated rule must still load", len(rs))
+	}
+	if rs[0].Source != "hazards.toml" || rs[1].Name != "chirp" {
+		t.Errorf("loaded %q from %s and %q, want hazards from hazards.toml and chirp", rs[0].Name, rs[0].Source, rs[1].Name)
+	}
+}
+
+// TestCompileLetsADisabledRuleShareAName: a disabled rule never reaches the
+// runner, so it cannot collide with anything. Rejecting it would make
+// enabled = false useless for the one thing it is most obviously for, keeping
+// the old copy of a rule around while a new one is tried.
+func TestCompileLetsADisabledRuleShareAName(t *testing.T) {
+	off := false
+	rs, errs := Compile([]RuleConfig{
+		{Name: "hazards", Source: "hazards.toml", Enabled: &off, On: []string{"alarm.triggered"}, Steps: []StepConfig{redisStep()}},
+		{Name: "hazards", Source: "hazards-v2.toml", On: []string{"alarm.triggered"}, Steps: []StepConfig{redisStep()}},
+	}, noState)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(rs) != 1 || rs[0].Source != "hazards-v2.toml" {
+		t.Errorf("got %d rules, want only the enabled one from hazards-v2.toml", len(rs))
+	}
+}
+
+// TestCompileFreesTheNameOfARuleThatFailedToLoad: a rule that does not load
+// holds no name, or a typo in one file would take the name away from a
+// working rule in another.
+func TestCompileFreesTheNameOfARuleThatFailedToLoad(t *testing.T) {
+	rs, errs := Compile([]RuleConfig{
+		{Name: "hazards", Source: "broken.toml", On: []string{"alarm.triggered"}, Steps: []StepConfig{{Do: "redis", List: "l", Push: "p", When: "this is not ( valid"}}},
+		{Name: "hazards", Source: "hazards.toml", On: []string{"alarm.triggered"}, Steps: []StepConfig{redisStep()}},
+	}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	if len(rs) != 1 || rs[0].Source != "hazards.toml" {
+		t.Errorf("got %d rules, want the working one from hazards.toml", len(rs))
+	}
+}
+
 func TestCompileRejectsMissingOn(t *testing.T) {
 	_, errs := Compile([]RuleConfig{{
 		Name: "r", Steps: []StepConfig{redisStep()},

@@ -275,14 +275,15 @@ func TestRunEndsWhenPoolRefusesAStep(t *testing.T) {
 }
 
 func TestActiveCountsARunUntilItEnds(t *testing.T) {
-	release := make(chan struct{})
+	gate, open := newGate()
+	defer open()
 	rec := &recorder{}
 	r := compileRule(t, rules.RuleConfig{
 		Name: "r", On: []string{"x.y"},
 		Steps: []rules.StepConfig{push("a", "1"), push("b", "2")},
 	}, nil)
 	blocking := fnAction{fn: func() error {
-		<-release
+		<-gate
 		return nil
 	}}
 	s := seqWith(t, r, blocking, rec.step("two"))
@@ -293,7 +294,7 @@ func TestActiveCountsARunUntilItEnds(t *testing.T) {
 	if n := rn.Active(); n != 1 {
 		t.Fatalf("Active() = %d while a step is running, want 1", n)
 	}
-	close(release)
+	open()
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
 	if got := rec.list(); !equal(got, []string{"two"}) {
 		t.Errorf("steps ran as %v, want two", got)
@@ -301,14 +302,15 @@ func TestActiveCountsARunUntilItEnds(t *testing.T) {
 }
 
 func TestStopAbandonsRunsAndRefusesNewOnes(t *testing.T) {
-	release := make(chan struct{})
+	gate, open := newGate()
+	defer open()
 	rec := &recorder{}
 	r := compileRule(t, rules.RuleConfig{
 		Name: "r", On: []string{"x.y"},
 		Steps: []rules.StepConfig{push("a", "1"), push("b", "2")},
 	}, nil)
 	blocking := fnAction{fn: func() error {
-		<-release
+		<-gate
 		return nil
 	}}
 	s := seqWith(t, r, blocking, rec.step("two"))
@@ -320,7 +322,7 @@ func TestStopAbandonsRunsAndRefusesNewOnes(t *testing.T) {
 	if n := rn.Active(); n != 0 {
 		t.Errorf("Active() = %d after Stop, want 0", n)
 	}
-	close(release)
+	open()
 
 	rn.Fire(seqWith(t, r, rec.step("three"), rec.step("four")), eventbus.Event{Topic: "x.y"})
 
@@ -529,6 +531,12 @@ func TestRestartIsTheDefaultWhenConcurrencyIsOmitted(t *testing.T) {
 // rather than on a timer, so "a run is live" is a fact rather than a race,
 // and then fires a third time after that run has ended: drop must mean
 // "ignored while busy", not "fires once and never again".
+//
+// The pool has two workers on purpose. With one, a restart would look exactly
+// like a drop from the outside: the replacement run's opening step would sit
+// in the pool queue behind the blocked worker, recording nothing, and the run
+// count would be 1 either way. The spare worker gives a replacement run
+// somewhere to run, so the middle assertion tells the two apart.
 func TestDropIgnoresAReFireWhileARunIsLive(t *testing.T) {
 	gate, open := newGate()
 	defer open()
@@ -539,16 +547,19 @@ func TestDropIgnoresAReFireWhileARunIsLive(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.gated("one", gate), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 2, 8), testSched(t), nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 	waitFor(t, "the first step to start", func() bool { return len(rec.list()) == 1 })
 
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	// Long enough for a replacement run to reach the free worker and record
+	// its opening step, which is what a restart would do here.
+	time.Sleep(30 * time.Millisecond)
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v, want only one; the re-fire started a run instead of being ignored", got)
+	}
 	if got := rn.Active(); got != 1 {
 		t.Errorf("Active() = %d after a dropped re-fire, want 1", got)
-	}
-	if got := rec.list(); !equal(got, []string{"one"}) {
-		t.Errorf("steps ran as %v, want only one; a re-fire must be ignored while a run is live", got)
 	}
 
 	open()
@@ -736,6 +747,40 @@ func TestCancelOnAlsoDropsQueuedFires(t *testing.T) {
 	}
 }
 
+// TestStopDropsQueuedFires: shutdown is the one moment where running the
+// backlog would be worst, since the pool is about to go away underneath it.
+// A stopped runner starts nothing, whatever is still queued behind the run it
+// abandoned.
+func TestStopDropsQueuedFires(t *testing.T) {
+	gate, open := newGate()
+	defer open()
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"}, Concurrency: "queue",
+		Steps: []rules.StepConfig{push("a", "1")},
+	}, nil)
+	s := seqWith(t, r, rec.gated("run", gate))
+
+	rn := NewRunner(startedPool(t, 2, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	waitFor(t, "the first run to start", func() bool { return len(rec.list()) == 1 })
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	rn.Stop()
+	if got := rn.Active(); got != 0 {
+		t.Errorf("Active() = %d after Stop, want 0", got)
+	}
+
+	open()
+	// The second worker is free the whole time, so a backlog that survived
+	// Stop would have somewhere to run immediately.
+	time.Sleep(50 * time.Millisecond)
+	if got := rec.list(); !equal(got, []string{"run"}) {
+		t.Errorf("steps ran as %v after Stop, want only the one already started", got)
+	}
+}
+
 // TestCancelLandingMidStepDoesNotLetOneMoreStepFire pins the re-check advance
 // makes under the lock immediately before Submit. The window it closes is the
 // gap between a run being found live and its next step being queued, and a
@@ -747,7 +792,8 @@ func TestCancelOnAlsoDropsQueuedFires(t *testing.T) {
 // Mutating the re-check in runStep into a no-op must fail this test.
 func TestCancelLandingMidStepDoesNotLetOneMoreStepFire(t *testing.T) {
 	reached := make(chan struct{})
-	release := make(chan struct{})
+	release, open := newGate()
+	defer open()
 	var once sync.Once
 
 	lookup := func(hash, field string) string {
@@ -777,7 +823,7 @@ func TestCancelLandingMidStepDoesNotLetOneMoreStepFire(t *testing.T) {
 	if got := rn.CancelMatching("alarm.disarmed"); got != 1 {
 		t.Fatalf("CancelMatching returned %d while the run sat in its step when, want 1", got)
 	}
-	close(release)
+	open()
 
 	select {
 	case <-twoRan:

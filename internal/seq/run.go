@@ -129,11 +129,12 @@ func (rn *Runner) Fire(s *Sequence, e eventbus.Event) {
 // count; keeping them would defeat the cancel, since the backlog is usually
 // more of exactly what is being cancelled.
 //
-// What a cancel stops is everything the run has not started yet: a pending
-// timer is dropped and no further step is submitted. A step already executing
-// on a worker runs to its end regardless. The pool owns that context and a
-// running action has no way in, so "cancel" here means the tail, not the step
-// under the needle.
+// What a cancel stops is everything the run has not handed over yet: a
+// pending timer is dropped and no further step is submitted. A step already
+// given to the pool still runs, whether a worker has picked it up or it is
+// waiting its turn in the queue behind other work. The pool owns an accepted
+// job either way and there is no way to take one back, so "cancel" here means
+// the tail, not the step already on its way.
 func (rn *Runner) CancelMatching(topic string) int {
 	rn.mu.Lock()
 
@@ -382,25 +383,25 @@ func (rn *Runner) Refused() uint64 {
 
 // Stop refuses new runs, throws away anything queued behind them, and
 // abandons the in-flight ones, cancelling any pending tail along the way: a
-// run parked on a timer is still active, and
-// letting that timer fire after the runner considers itself stopped would
-// submit a step into a pool that may already be gone. A step already on a
-// worker still runs to the end; its callback then finds the run ended and
-// stops there rather than queueing more work into a pool that is going away.
+// run parked on a timer is still active, and letting that timer fire after
+// the runner considers itself stopped would submit a step into a pool that
+// may already be gone. A step already on a worker still runs to the end; its
+// callback then finds the run ended and stops there rather than queueing more
+// work into a pool that is going away.
+//
+// Ending goes through endLocked like every other cancel, so there is one
+// definition of what ending a run means rather than two that can drift.
 func (rn *Runner) Stop() {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
 	rn.stopped = true
 	for _, list := range rn.runs {
-		for _, r := range list {
-			r.ended = true
-			if r.cancelTail != nil {
-				r.cancelTail()
-				r.cancelTail = nil
-			}
+		// Copied because endLocked edits the slice it is walking, and deletes
+		// the key once the last run leaves it.
+		for _, r := range append([]*run(nil), list...) {
+			rn.endLocked(r)
 		}
 	}
-	rn.runs = make(map[string][]*run)
 	rn.queued = make(map[string][]queuedFire)
 }

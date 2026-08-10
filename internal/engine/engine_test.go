@@ -57,13 +57,20 @@ func horn() rules.StepConfig {
 
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
+	if !waitUntil(cond) {
+		t.Fatal("condition not met within 2s")
+	}
+}
+
+// waitUntil polls cond and reports whether it came true inside the window, so
+// a caller that has something specific to say about the failure can say it
+// instead of leaving a bare timeout behind.
+func waitUntil(cond func() bool) bool {
 	deadline := time.Now().Add(2 * time.Second)
 	for !cond() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if !cond() {
-		t.Fatal("condition not met within 2s")
-	}
+	return cond()
 }
 
 func TestHandleDispatchesMatchingRule(t *testing.T) {
@@ -290,6 +297,52 @@ func TestOneEventCanCancelOneRuleAndFireAnother(t *testing.T) {
 	want := []string{"scooter:blinker=both", "scooter:horn=short"}
 	if got := p.list(); got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("pushes were %v, want %v; one event cancels one rule and fires another", got, want)
+	}
+}
+
+// TestCancelIsAppliedBeforeMatching pins the order of the two halves of
+// Handle. A rule that names one topic in both on and cancel-on is the case
+// that can tell them apart: cancelling first finds nothing live and lets the
+// rule run, which under restart is what naming a topic in both means, while
+// cancelling afterwards kills the run the same event has just started and the
+// rule never gets past its first step. The second rule is there to show the
+// cancelling event still fires everything else it matches.
+func TestCancelIsAppliedBeforeMatching(t *testing.T) {
+	p := &recordingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	rs := compileRules(t,
+		rules.RuleConfig{
+			Name: "hazards", On: []string{"alarm.triggered"}, CancelOn: []string{"alarm.triggered"},
+			Steps: []rules.StepConfig{
+				{Do: "redis", List: "scooter:blinker", Push: "both"},
+				{Do: "redis", List: "scooter:blinker", Push: "off", After: "1h"},
+			},
+		},
+		rules.RuleConfig{
+			Name: "chirp", On: []string{"alarm.triggered"},
+			Steps: []rules.StepConfig{{Do: "redis", List: "scooter:horn", Push: "short"}},
+		},
+	)
+	sch := testSched(t)
+	en, errs := New(rs, pool, sch, p, nopLog{})
+	if len(errs) != 0 {
+		t.Fatalf("New: %v", errs)
+	}
+	defer en.Stop()
+
+	en.Handle(eventbus.Event{Topic: "alarm.triggered"})
+	waitFor(t, func() bool { return len(p.list()) == 2 })
+
+	// The tail is scheduled from the first step's completion, so it is worth
+	// the same polling window as the pushes rather than a single read.
+	if !waitUntil(func() bool { return sch.Pending() == 1 }) {
+		t.Errorf("the rule's tail is not pending; a cancel applied after matching kills the run the same event started")
+	}
+	if got := p.list(); got[1] != "scooter:horn=short" {
+		t.Errorf("pushes were %v, want the second rule to fire on the same event", got)
 	}
 }
 
