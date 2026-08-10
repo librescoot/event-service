@@ -251,3 +251,24 @@ func TestNewErrorNamesRuleAndFile(t *testing.T) {
 		t.Errorf("error should name the file, got %q", msg)
 	}
 }
+
+// TestNewErrorNamesRuleFileAndStepTogether checks the three parts in one
+// message. The rule and the file are added here, the step index inside
+// seq.Build, and each half has its own test, so a regression that drops one
+// of them would leave both of those green.
+func TestNewErrorNamesRuleFileAndStepTogether(t *testing.T) {
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "hazards", Source: "hazards.toml", On: []string{"x.y"},
+		Steps: []rules.StepConfig{horn(), {Do: "telepathy"}},
+	})
+	_, errs := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	msg := errs[0].Error()
+	for _, want := range []string{"hazards", "hazards.toml", "step 1"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should mention %s, got %q", want, msg)
+		}
+	}
+}

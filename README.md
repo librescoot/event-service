@@ -72,8 +72,11 @@ cleanly; it does not skip ahead to the next step.
 
 Not supported yet: `after`, `concurrency`, `cancel-on`, `repeat`, `debounce`,
 and the `can`, `lua`, and `http` step kinds. A rule using any of these fails
-to load with an error naming the rule, the file, and the step it is on,
-rather than silently doing nothing. This includes writing the empty
+to load rather than silently doing nothing. The error always names the rule
+and the file; where the offending key belongs to a step (`after`, and any
+problem with a step's `do` or `when`) it also names the step index.
+`concurrency`, `cancel-on`, `repeat` and `debounce` sit on the rule itself,
+so their errors have no step to name. This includes writing the empty
 form of a feature (`cancel-on = []`, `repeat = {}`, `debounce = "0s"`): the
 key being present is what is rejected, not whether its value would have done
 anything.

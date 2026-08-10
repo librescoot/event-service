@@ -13,8 +13,8 @@ type Logger interface {
 	Printf(format string, v ...any)
 }
 
-// run is one walk over a sequence's steps. step is the index of the step to
-// submit next, and ended marks a run that must not move any further.
+// run is one walk over a sequence's steps. step is the index of the next step
+// to claim, and ended marks a run that must not move any further.
 //
 // Both fields are guarded by the Runner's mutex: a run starts on the bus
 // subscriber goroutine and then moves forward on whichever pool worker
@@ -77,7 +77,13 @@ func (rn *Runner) advance(r *run) {
 		rn.mu.Unlock()
 		return
 	}
+	// The index moves on in the same critical section that read it, so two
+	// calls for the same run claim different steps instead of both claiming
+	// this one. Nothing puts it back: a step that is not submitted ends the
+	// run outright, so an index one past a step that never ran is only ever
+	// read by a run that is finished with it.
 	idx := r.step
+	r.step = idx + 1
 	rn.mu.Unlock()
 
 	name := r.seq.Rule.Name
@@ -103,6 +109,15 @@ func (rn *Runner) advance(r *run) {
 		}
 	}
 
+	// The step is queued with the lock held, after one more check that the run
+	// is still live. Submit neither blocks nor calls done inline, so holding
+	// the mutex across it costs nothing and leaves no window in which a
+	// cancelled run gets one more step out of the door.
+	rn.mu.Lock()
+	if r.ended || rn.stopped {
+		rn.mu.Unlock()
+		return
+	}
 	submitted := rn.pool.Submit(step.Action, r.event, name, func(err error) {
 		if err != nil {
 			// A sequence is a recipe, so a failed step ends it. Carrying on
@@ -113,11 +128,9 @@ func (rn *Runner) advance(r *run) {
 			rn.end(r)
 			return
 		}
-		rn.mu.Lock()
-		r.step = idx + 1
-		rn.mu.Unlock()
 		rn.advance(r)
 	})
+	rn.mu.Unlock()
 
 	if !submitted {
 		// A refused job never calls done, so no callback is coming to move
