@@ -537,3 +537,60 @@ func TestCompileRejectsZeroDebounceNamingTheRule(t *testing.T) {
 		}
 	}
 }
+
+// TestAStepFingerprintIsTheSameOnEveryCompile is what a pending record rests
+// on. The record is written by one process and checked by the next, which
+// compiles the same file again from scratch, so a fingerprint that picked up
+// anything from its own compile would drop every real record at the next
+// start and turn restart durability off with nothing logged but a routine
+// drop.
+func TestAStepFingerprintIsTheSameOnEveryCompile(t *testing.T) {
+	cfg := RuleConfig{
+		Name: "hazards", On: []string{"alarm.triggered"},
+		Steps: []StepConfig{
+			redisStep(),
+			{Do: "redis", List: "scooter:blinker", Push: "off", After: "30s", When: `to == "armed"`},
+		},
+	}
+
+	first := mustCompileOne(t, cfg, noState)
+	second := mustCompileOne(t, cfg, noState)
+
+	for i := range first.Steps {
+		if first.Steps[i].Fingerprint == "" {
+			t.Fatalf("step %d has no fingerprint", i)
+		}
+		if first.Steps[i].Fingerprint != second.Steps[i].Fingerprint {
+			t.Errorf("step %d fingerprints as %q and then %q; the same config must fingerprint the same on every compile",
+				i, first.Steps[i].Fingerprint, second.Steps[i].Fingerprint)
+		}
+	}
+}
+
+// TestStepsThatDoDifferentThingsFingerprintDifferently is the other half:
+// a fingerprint that never changes would let a rewritten step be fired by a
+// record written for what used to be there.
+func TestStepsThatDoDifferentThingsFingerprintDifferently(t *testing.T) {
+	base := StepConfig{Do: "redis", List: "scooter:blinker", Push: "off", After: "30s"}
+
+	variants := map[string]StepConfig{
+		"push":    {Do: "redis", List: "scooter:blinker", Push: "on", After: "30s"},
+		"list":    {Do: "redis", List: "scooter:horn", Push: "off", After: "30s"},
+		"after":   {Do: "redis", List: "scooter:blinker", Push: "off", After: "45s"},
+		"when":    {Do: "redis", List: "scooter:blinker", Push: "off", After: "30s", When: `to == "armed"`},
+		"durable": {Do: "redis", List: "scooter:blinker", Push: "off", After: "30s", Durable: func() *bool { b := false; return &b }()},
+	}
+
+	want := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"}, Steps: []StepConfig{base},
+	}, noState).Steps[0].Fingerprint
+
+	for name, sc := range variants {
+		got := mustCompileOne(t, RuleConfig{
+			Name: "r", On: []string{"x.y"}, Steps: []StepConfig{sc},
+		}, noState).Steps[0].Fingerprint
+		if got == want {
+			t.Errorf("a step differing in %s fingerprints the same as the original; an edited step would be fired by the old record", name)
+		}
+	}
+}

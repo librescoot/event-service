@@ -41,8 +41,17 @@ func (h *memHash) HSet(key, field string, value any) error {
 
 	// Outside the lock on purpose: a test holding this open still has to be
 	// able to read the hash it is holding open.
+	//
+	// The handshake is selected against release rather than sent
+	// unconditionally, so a write arriving after the hold has been opened
+	// passes straight through. An unconditional send would block forever on
+	// an unbuffered channel nobody is receiving from any more, and a worker
+	// stuck there takes Pool.Stop, and the whole package, down with it.
 	if entered != nil {
-		entered <- field
+		select {
+		case entered <- field:
+		case <-release:
+		}
 		<-release
 	}
 	return nil
@@ -200,6 +209,31 @@ func waitEntered(t *testing.T, entered <-chan string) {
 	case <-entered:
 	case <-time.After(2 * time.Second):
 		t.Fatal("no record was written; the step under test is not durable")
+	}
+}
+
+// TestAHeldWriteStopsHoldingOnceItIsOpened guards the helper rather than the
+// code: a second write arriving after the hold is open must not park on the
+// handshake. A worker stuck there is waited on by Pool.Stop, which turns any
+// later failure in this package into a hang instead of a red line.
+func TestAHeldWriteStopsHoldingOnceItIsOpened(t *testing.T) {
+	h := newMemHash()
+	entered, open := h.hold()
+	defer open()
+
+	go func() { _ = h.HSet("k", "first", "1") }()
+	waitEntered(t, entered)
+	open()
+
+	done := make(chan struct{})
+	go func() {
+		_ = h.HSet("k", "second", "2")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a write after the hold was opened is still blocked on the handshake")
 	}
 }
 
@@ -650,21 +684,29 @@ func TestStopLeavesTheRecordForReplay(t *testing.T) {
 // end, and the only test where the record is written by a run rather than by
 // the test. One runner parks a durable step and goes away with the record
 // still in the hash, the way a service stopped mid-wait does; a second runner
-// over the same hash picks it up and finishes the sequence. Anything the
-// writing side leaves out of a record, a fingerprint above all, strands every
-// real record at the next start while every hand-seeded test still passes.
+// picks it up and finishes the sequence.
+//
+// The second runner gets a sequence compiled fresh from the same config, not
+// the one the first runner used. That is what a start does: it reads the TOML
+// again rather than inheriting the objects the previous process built, so the
+// record only survives if a fingerprint the compiler produces a second time
+// equals the one that was written down. Handing over the same *Sequence would
+// prove no more than that the fingerprint is not empty, and anything the
+// fingerprint picked up from its own compile, a pointer, a timestamp, a map
+// walk, would strand every real record at the next start with nothing logged
+// but a routine drop.
 func TestARecordWrittenByARunReplaysIntoANewRunner(t *testing.T) {
 	st, _ := memStore(t, nopLog{})
 	rec := &recorder{}
-	r := compileRule(t, rules.RuleConfig{
+	cfg := rules.RuleConfig{
 		Name: "hazards", On: []string{"alarm.triggered"},
 		Steps: []rules.StepConfig{
 			push("a", "1"),
 			{Do: "redis", List: "b", Push: "2", After: "80ms"},
 			push("c", "3"),
 		},
-	}, nil)
-	s := seqWith(t, r, rec.step("on"), rec.step("off"), rec.step("after"))
+	}
+	s := seqWith(t, compileRule(t, cfg, nil), rec.step("on"), rec.step("off"), rec.step("after"))
 
 	first := NewRunner(startedPool(t, 1, 8), testSched(t), st, nopLog{})
 	first.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
@@ -675,9 +717,12 @@ func TestARecordWrittenByARunReplaysIntoANewRunner(t *testing.T) {
 		t.Fatalf("steps ran as %v before the restart, want only on", got)
 	}
 
+	// The next start, compiling the same file again.
+	restarted := seqWith(t, compileRule(t, cfg, nil), rec.step("on"), rec.step("off"), rec.step("after"))
+
 	second := NewRunner(startedPool(t, 1, 8), testSched(t), st, nopLog{})
-	if n := second.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
-		t.Fatalf("Replay resumed %d step(s), want 1; a record a run wrote must be one a start can read", n)
+	if n := second.Replay([]*Sequence{restarted}, 5*time.Minute); n != 1 {
+		t.Fatalf("Replay resumed %d step(s), want 1; a record a run wrote must be one a fresh compile can still read", n)
 	}
 
 	waitFor(t, "the resumed run to end", func() bool { return second.Active() == 0 })
