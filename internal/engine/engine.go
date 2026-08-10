@@ -65,6 +65,14 @@ func New(rs []*rules.Rule, pool *action.Pool, sch *sched.Scheduler, store *seq.P
 // RuleCount is how many rules are live.
 func (en *Engine) RuleCount() int { return len(en.bounds) }
 
+// Active is how many sequence runs are part-way through their steps right
+// now, forwarded from the runner.
+func (en *Engine) Active() int { return en.runner.Active() }
+
+// Refused is how many triggers a queue-policy rule has turned away since
+// start because its backlog was full, forwarded from the runner.
+func (en *Engine) Refused() uint64 { return en.runner.Refused() }
+
 // Replay resumes the steps that were waiting when the service last went down
 // and returns how many it picked up. Call it before subscribing to the bus,
 // so a resumed step cannot race a live re-fire of the same rule; a record

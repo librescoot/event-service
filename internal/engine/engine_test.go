@@ -497,6 +497,67 @@ func TestPendingDebounceIsDroppedOnShutdown(t *testing.T) {
 	}
 }
 
+// TestActiveForwardsTheRunnersCount pins the forwarding rather than
+// re-testing the runner's own bookkeeping, which internal/seq already
+// covers: a rule that parks its only step for an hour keeps its run live for
+// the length of the test.
+func TestActiveForwardsTheRunnersCount(t *testing.T) {
+	p := &countingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Steps: []rules.StepConfig{{Do: "redis", List: "a", Push: "1", After: "1h"}},
+	})
+	en, errs := New(rs, pool, testSched(t), nil, p, nopLog{})
+	if len(errs) != 0 {
+		t.Fatalf("New: %v", errs)
+	}
+	defer en.Stop()
+
+	if got := en.Active(); got != 0 {
+		t.Fatalf("Active() = %d before any trigger, want 0", got)
+	}
+
+	en.Handle(eventbus.Event{Topic: "x.y"})
+	waitFor(t, func() bool { return en.Active() == 1 })
+}
+
+// TestRefusedForwardsTheRunnersCount is Refused()'s first production caller:
+// nothing read this counter before the extensions-hash publisher. maxQueued
+// is 8 (internal/seq), so the first trigger starts the live run, the next 8
+// fill the backlog, and the rest are refused.
+func TestRefusedForwardsTheRunnersCount(t *testing.T) {
+	p := &countingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"}, Concurrency: "queue",
+		Steps: []rules.StepConfig{{Do: "redis", List: "a", Push: "1", After: "1h"}},
+	})
+	en, errs := New(rs, pool, testSched(t), nil, p, nopLog{})
+	if len(errs) != 0 {
+		t.Fatalf("New: %v", errs)
+	}
+	defer en.Stop()
+
+	if got := en.Refused(); got != 0 {
+		t.Fatalf("Refused() = %d before any trigger, want 0", got)
+	}
+
+	for i := 0; i < 1+8+3; i++ {
+		en.Handle(eventbus.Event{Topic: "x.y"})
+	}
+
+	if got := en.Refused(); got != 3 {
+		t.Errorf("Refused() = %d, want 3", got)
+	}
+}
+
 func TestNewReportsUnbuildableRuleWithoutLosingTheRest(t *testing.T) {
 	rs := compileRules(t,
 		rules.RuleConfig{Name: "good", On: []string{"x.y"}, Steps: []rules.StepConfig{horn()}},

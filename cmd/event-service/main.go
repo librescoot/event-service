@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/librescoot/event-service/internal/sched"
 	"github.com/librescoot/event-service/internal/seq"
 	"github.com/librescoot/event-service/internal/shadow"
+	"github.com/librescoot/event-service/internal/stats"
 	"github.com/librescoot/eventbus"
 	ipc "github.com/librescoot/redis-ipc"
 )
@@ -103,6 +105,22 @@ func main() {
 	if n := en.Replay(*replayWin); n > 0 {
 		log.Printf("rules: resumed %d pending step(s) from before the restart", n)
 	}
+
+	// TODO(task 9): promote this literal to a --stats-interval flag.
+	statsPub := stats.NewPublisher(client, 10*time.Second, log.Default())
+	statsPub.Start(func() map[string]string {
+		ps := pool.Stats()
+		return map[string]string{
+			"rules":       strconv.Itoa(en.RuleCount()),
+			"dispatched":  strconv.FormatUint(ps.Dispatched, 10),
+			"dropped":     strconv.FormatUint(ps.Dropped+en.Refused(), 10),
+			"failed":      strconv.FormatUint(ps.Failed, 10),
+			"pending":     strconv.Itoa(sch.Pending()),
+			"runs-active": strconv.Itoa(en.Active()),
+			"version":     version,
+		}
+	})
+	defer statsPub.Stop()
 
 	if en.RuleCount() > 0 {
 		patterns := en.Patterns()
