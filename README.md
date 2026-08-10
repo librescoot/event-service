@@ -43,9 +43,14 @@ Example, `/data/extensions/demo.toml`:
 `on` matches against event topics: an exact topic, `*` for everything, or
 `prefix.*` for anything starting with `prefix.`. `when` is
 an expression evaluated against the event: `topic`, `src`, `from`, `to`,
-`data`, and `state("hash", "field")` for reading current values out of the
-datastore that the event itself does not carry. A rule with no `when` fires
-on every event matching `on`.
+`data`, and `state("hash", "field")` for reading the last observed value of a
+hash field that the event itself does not carry. `state` reads event-service's
+own in-memory shadow store, not the datastore directly: only the handful of
+hashes an adapter watches are in it, and only fields seen since the process
+started. A field that exists in the datastore but has not changed since
+startup, or that belongs to a hash nothing watches, reads back as `""`,
+indistinguishable from a genuinely empty value. A rule with no `when` fires on
+every event matching `on`.
 
 `cooldown` (a duration, e.g. `"30s"`) suppresses repeat firing of a rule
 within the given window after it last fired.
@@ -58,8 +63,25 @@ Supported `do` kinds for `[[rule.step]]`:
 Not supported yet: multiple steps per rule, `after`, `concurrency`,
 `cancel-on`, `repeat`, `debounce`, and the `can`, `lua`, and `http` step
 kinds. A rule using any of these fails to load with an error naming the rule
-and file, rather than silently doing nothing.
+and file, rather than silently doing nothing. This includes writing the empty
+form of a feature (`cancel-on = []`, `repeat = {}`, `debounce = "0s"`): the
+key being present is what is rejected, not whether its value would have done
+anything.
 
-`durable` is not a recognised key at all yet, on either a rule or a step. TOML
-decoding does not reject unknown keys, so writing `durable = true` loads
-without error and is simply ignored. Do not rely on it.
+`durable` is not a recognised key at all, on either a rule or a step, and
+neither is any key not listed above. A file containing one fails to load: the
+error names the file and the offending key, and the rest of that file's rules
+do not load either. Other files in the extensions directory are unaffected.
+
+## A note on safety
+
+There is no allowlist, no rate limit, and no interlock on what a rule can do.
+A `redis` step can `LPUSH` onto `scooter:state`, `scooter:horn`,
+`scooter:blinker`, `scooter:seatbox`, or any other command queue, as freely as
+vehicle-service's legitimate callers can. Two rules can watch each other's
+output topics and cycle a command back and forth indefinitely, including
+through the steering lock; nothing here detects or breaks that loop. This is
+the same position `EVENT-SERVICE-DESIGN.md` takes on the `can` step kind: the
+extension subsystem is a power-user feature, and it is deliberately not
+event-service's job to second-guess what a rule tells the vehicle to do.
+Write rules with that in mind.
