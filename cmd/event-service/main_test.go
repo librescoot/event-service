@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 	"github.com/librescoot/event-service/internal/engine"
 	"github.com/librescoot/event-service/internal/rules"
 	"github.com/librescoot/event-service/internal/sched"
+	"github.com/librescoot/event-service/internal/seq"
 	"github.com/librescoot/eventbus"
 )
 
@@ -19,6 +22,64 @@ func (nopLog) Printf(string, ...any) {}
 type nopPusher struct{}
 
 func (nopPusher) LPush(string, ...any) (int64, error) { return 1, nil }
+
+// memPending is the pending hash in memory. seq.NewPendingStore writes to one
+// fixed hash name, so a live datastore would have these tests reading records
+// belonging to another package's tests, or to a service running on the same
+// box. It counts writes, because the zero-rules path has to add no work at
+// all rather than merely end up with an empty hash.
+type memPending struct {
+	mu     sync.Mutex
+	fields map[string]string
+	writes int
+}
+
+func newMemPending() *memPending { return &memPending{fields: make(map[string]string)} }
+
+func (h *memPending) HSet(_, field string, value any) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.fields[field] = fmt.Sprint(value)
+	h.writes++
+	return nil
+}
+
+func (h *memPending) HGetAll(string) (map[string]string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[string]string, len(h.fields))
+	for k, v := range h.fields {
+		out[k] = v
+	}
+	return out, nil
+}
+
+func (h *memPending) HDel(_ string, fields ...string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, f := range fields {
+		delete(h.fields, f)
+	}
+	return nil
+}
+
+func (h *memPending) written() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.writes
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
@@ -95,5 +156,115 @@ func TestBuildSnapshotKeepsDroppedAndRefusedApart(t *testing.T) {
 	}
 	if got["refused"] != "5" {
 		t.Errorf(`snapshot["refused"] = %q, want "5"; it must not include the pool's drops`, got["refused"])
+	}
+}
+
+// TestStartRulesReplaysBeforeItSubscribes is the only mechanical check on an
+// ordering that is otherwise a matter of reading main from top to bottom. A
+// step recorded before the restart has to be back in the runner before the
+// bus can deliver anything, or a live event re-firing the same rule meets a
+// concurrency policy applied against a run that has not been resumed yet: the
+// restart drops nothing, and the resumed tail and the fresh run both push.
+//
+// The seeded record is an hour from due, so the run it resumes is parked and
+// countable for the whole test rather than racing the assertion.
+func TestStartRulesReplaysBeforeItSubscribes(t *testing.T) {
+	h := newMemPending()
+	store := seq.NewPendingStore(h, nopLog{})
+
+	rs, errs := rules.Compile([]rules.RuleConfig{{
+		Name: "hazards-on-alarm", On: []string{"alarm.triggered"}, CancelOn: []string{"alarm.disarmed"},
+		Steps: []rules.StepConfig{
+			{Do: "redis", List: "scooter:blinker", Push: "both"},
+			{Do: "redis", List: "scooter:blinker", Push: "off", After: "1h"},
+		},
+	}}, func(string, string) string { return "" })
+	if len(errs) != 0 {
+		t.Fatalf("compile: %v", errs)
+	}
+
+	if err := store.Put(seq.Pending{
+		ID: "hazards-on-alarm#1-1", Rule: "hazards-on-alarm", Step: 1,
+		FireAt:      time.Now().Add(time.Hour).UnixMilli(),
+		Fingerprint: rs[0].Steps[1].Fingerprint,
+		Event:       eventbus.Event{Topic: "alarm.triggered"},
+	}); err != nil {
+		t.Fatalf("seed a pending record: %v", err)
+	}
+
+	sch := sched.New()
+	defer sch.Stop()
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+	en, buildErrs := engine.New(rs, pool, sch, store, nopPusher{}, nopLog{})
+	if len(buildErrs) != 0 {
+		t.Fatalf("engine.New: %v", buildErrs)
+	}
+	defer en.Stop()
+
+	var (
+		subscribes  int
+		patterns    []string
+		activeAtSub int
+		closed      bool
+	)
+	stop := startRules(en, 5*time.Minute, func(p []string) func() {
+		subscribes++
+		patterns = p
+		activeAtSub = en.Active()
+		return func() { closed = true }
+	}, nopLog{})
+
+	if subscribes != 1 {
+		t.Fatalf("subscribed %d time(s), want 1", subscribes)
+	}
+	if activeAtSub != 1 {
+		t.Errorf("%d run(s) were live when the subscription opened, want 1; the recorded step must be resumed before the bus can deliver an event that fires the same rule", activeAtSub)
+	}
+	want := []string{eventbus.ChannelPrefix + "alarm.triggered", eventbus.ChannelPrefix + "alarm.disarmed"}
+	if !equalStrings(patterns, want) {
+		t.Errorf("subscribed to %v, want %v", patterns, want)
+	}
+
+	stop()
+	if !closed {
+		t.Error("the function startRules returns must close the subscription it opened, or shutdown leaves the bus reader running")
+	}
+}
+
+// TestStartRulesDoesNotSubscribeWithNoRules is what keeps an idle scooter at
+// zero events and zero datastore writes per second. With nothing installed in
+// the extensions directory there is nothing to match, so the process must not
+// be woken by bus traffic at all, and nothing may be scheduled or recorded.
+func TestStartRulesDoesNotSubscribeWithNoRules(t *testing.T) {
+	h := newMemPending()
+	store := seq.NewPendingStore(h, nopLog{})
+
+	sch := sched.New()
+	defer sch.Stop()
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+	en, buildErrs := engine.New(nil, pool, sch, store, nopPusher{}, nopLog{})
+	if len(buildErrs) != 0 {
+		t.Fatalf("engine.New: %v", buildErrs)
+	}
+	defer en.Stop()
+
+	stop := startRules(en, 5*time.Minute, func(patterns []string) func() {
+		t.Errorf("subscribed to %v with no rules live; an idle scooter must not be woken by bus traffic nothing can match", patterns)
+		return func() {}
+	}, nopLog{})
+	stop()
+
+	if got := sch.Pending(); got != 0 {
+		t.Errorf("the scheduler holds %d pending fire(s) with no rules live, want 0", got)
+	}
+	if got := en.Active(); got != 0 {
+		t.Errorf("%d run(s) live with no rules live, want 0", got)
+	}
+	if got := h.written(); got != 0 {
+		t.Errorf("the pending store was written %d time(s) with no rules live, want 0", got)
 	}
 }
