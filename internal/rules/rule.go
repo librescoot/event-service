@@ -2,6 +2,9 @@ package rules
 
 import (
 	"fmt"
+	"hash/fnv"
+	"io"
+	"strconv"
 	"time"
 
 	"github.com/expr-lang/expr"
@@ -65,12 +68,16 @@ type Repeat struct {
 // against the clock, not against When, so a step can wait and still carry
 // its own condition.
 // Durable, which only a step with After can be, records the step's pending
-// fire so a service restart during the wait does not lose it.
+// fire so a service restart during the wait does not lose it. Fingerprint
+// identifies what the step was configured to do, so a record written for it
+// can be told apart from a record written for whatever now sits at the same
+// index.
 type Step struct {
-	Config  StepConfig
-	When    *vm.Program
-	After   time.Duration
-	Durable bool
+	Config      StepConfig
+	When        *vm.Program
+	After       time.Duration
+	Durable     bool
+	Fingerprint string
 }
 
 // Compile turns parsed config into runnable rules. Errors are per-rule, so one
@@ -207,7 +214,7 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 			durable = *sc.Durable
 		}
 
-		s := Step{Config: sc, After: after, Durable: durable}
+		s := Step{Config: sc, After: after, Durable: durable, Fingerprint: stepFingerprint(sc, durable)}
 		if sc.When != "" {
 			p, err := compileWhen(sc.When)
 			if err != nil {
@@ -219,6 +226,28 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 	}
 
 	return r, nil
+}
+
+// stepFingerprint identifies a step by what it was configured to do. A
+// pending record carries the fingerprint of the step it was written for, so a
+// user who reordered or rewrote their steps while the service was down gets
+// the record dropped rather than the step at that index fired in place of the
+// one that was actually waiting. Everything the step does is in it: the action
+// and its arguments, the condition, the timing.
+//
+// A 64-bit non-cryptographic hash is enough. Nothing here defends against a
+// deliberately crafted collision; the case being caught is a user editing
+// their own file.
+func stepFingerprint(c StepConfig, durable bool) string {
+	h := fnv.New64a()
+	for _, part := range []string{c.Do, c.After, c.When, c.List, c.Push, c.Command, c.Timeout} {
+		_, _ = io.WriteString(h, part)
+		_, _ = h.Write([]byte{0})
+	}
+	if durable {
+		_, _ = io.WriteString(h, "durable")
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 // compileWhen turns one condition into a program. Rule-level and step-level

@@ -93,10 +93,11 @@ func seqWith(t *testing.T, r *rules.Rule, acts ...action.Action) *Sequence {
 	s := &Sequence{Rule: r, Steps: make([]CompiledStep, len(acts))}
 	for i, a := range acts {
 		s.Steps[i] = CompiledStep{
-			Action:  a,
-			When:    r.Steps[i].When,
-			After:   r.Steps[i].After,
-			Durable: r.Steps[i].Durable,
+			Action:      a,
+			When:        r.Steps[i].When,
+			After:       r.Steps[i].After,
+			Durable:     r.Steps[i].Durable,
+			Fingerprint: r.Steps[i].Fingerprint,
 		}
 	}
 	return s

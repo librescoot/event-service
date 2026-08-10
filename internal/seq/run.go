@@ -30,8 +30,9 @@ type Logger interface {
 // a run that must not move any further. cancelTail holds the scheduler cancel
 // for whatever this run is currently parked on, a step's own after or the gap
 // between one repeat pass and the next; it is nil whenever the run is not
-// waiting on a timer. rec says the datastore holds a pending record under id,
-// which exactly one of the fire path or whatever ends the run must remove.
+// waiting on a timer. rec says the datastore holds a pending record under id
+// for the step at recStep, which exactly one of the fire path or whatever
+// ends the run must remove.
 //
 // id is the run's field name in the pending hash. It stays the same for the
 // whole run: a run waits on at most one step at a time, so one field is
@@ -49,6 +50,7 @@ type run struct {
 	pass       int
 	ended      bool
 	rec        bool
+	recStep    int
 	cancelTail func() bool
 }
 
@@ -129,7 +131,7 @@ func (rn *Runner) Fire(s *Sequence, e eventbus.Event) {
 		return
 	}
 	name := s.Rule.Name
-	var records []string
+	var records []pendingRef
 
 	rn.mu.Lock()
 	if rn.stopped {
@@ -159,8 +161,8 @@ func (rn *Runner) Fire(s *Sequence, e eventbus.Event) {
 			// Restart. The live runs are copied out before they are walked,
 			// because endLocked edits the slice they are in.
 			for _, other := range append([]*run(nil), rn.runs[name]...) {
-				if _, id := rn.endLocked(other); id != "" {
-					records = append(records, id)
+				if _, ref := rn.endLocked(other); ref.id != "" {
+					records = append(records, ref)
 				}
 			}
 		}
@@ -189,7 +191,7 @@ func (rn *Runner) Fire(s *Sequence, e eventbus.Event) {
 // job either way and there is no way to take one back, so "cancel" here means
 // the tail, not the step already on its way.
 func (rn *Runner) CancelMatching(topic string) int {
-	var records []string
+	var records []pendingRef
 
 	rn.mu.Lock()
 
@@ -202,12 +204,12 @@ func (rn *Runner) CancelMatching(topic string) int {
 		// Copied for the same reason as in Fire: endLocked edits rn.runs[name]
 		// underneath a walk over it.
 		for _, r := range append([]*run(nil), list...) {
-			ended, id := rn.endLocked(r)
+			ended, ref := rn.endLocked(r)
 			if ended {
 				n++
 			}
-			if id != "" {
-				records = append(records, id)
+			if ref.id != "" {
+				records = append(records, ref)
 			}
 		}
 	}
@@ -318,7 +320,7 @@ func (rn *Runner) finishPass(r *run) {
 // to take it away again.
 func (rn *Runner) deferStep(r *run, idx, iter int, step CompiledStep) {
 	if step.Durable {
-		rn.putRecord(r, idx, iter, step.After)
+		rn.putRecord(r, idx, iter, step)
 	}
 	rn.park(r, idx, step, step.After)
 }
@@ -329,16 +331,9 @@ func (rn *Runner) deferStep(r *run, idx, iter int, step CompiledStep) {
 func (rn *Runner) park(r *run, idx int, step CompiledStep, d time.Duration) {
 	rn.mu.Lock()
 	if r.ended || rn.stopped {
-		// A shutdown leaves the record where it is: that is the whole point,
-		// since the next start is what will run the step. A run that ended
-		// any other way was ended before its record existed, so nobody else
-		// is going to remove it.
-		var id string
-		if !rn.stopped {
-			id = claimRecordLocked(r)
-		}
+		ref := rn.releaseRecordLocked(r)
 		rn.mu.Unlock()
-		rn.dropRecord(id)
+		rn.dropRecord(ref)
 		return
 	}
 	// The cancel is stored under the same lock that a concurrent end or Stop
@@ -362,30 +357,49 @@ func (rn *Runner) fireDeferred(r *run, idx int, step CompiledStep) {
 		return
 	}
 	r.cancelTail = nil
-	id := claimRecordLocked(r)
+	ref := claimRecordLocked(r)
 	rn.mu.Unlock()
 
-	rn.dropRecord(id)
+	rn.dropRecord(ref)
 	rn.runStep(r, idx, step)
+}
+
+// releaseRecordLocked decides what happens to the record of a run that has
+// already ended, or of any run once the runner is stopping, by the time park
+// gets to it. It is its own function so a test can drive the window between
+// the record being written and the timer being armed, which is short, is
+// reachable from the bus goroutine, and holds both halves of what this
+// feature is for.
+//
+// A shutdown leaves the record where it is: that is the whole point, since
+// the next start is what will run the step. A run that ended any other way
+// was ended by something that found no record to claim, because the record
+// was written after it looked, so nobody else is going to remove it.
+func (rn *Runner) releaseRecordLocked(r *run) pendingRef {
+	if rn.stopped {
+		return pendingRef{}
+	}
+	return claimRecordLocked(r)
 }
 
 // putRecord writes the run's pending record and marks the run as holding one.
 // It runs outside the runner lock: endLocked is on the path of every
 // finishing run, so a datastore round trip held under that mutex would sit in
 // front of every other rule on a one-core box.
-func (rn *Runner) putRecord(r *run, idx, iter int, d time.Duration) {
+func (rn *Runner) putRecord(r *run, idx, iter int, step CompiledStep) {
 	if rn.store == nil {
 		return
 	}
 	rule := r.seq.Rule
 	err := rn.store.Put(Pending{
-		ID:     r.id,
-		Rule:   rule.Name,
-		Source: rule.Source,
-		Step:   idx,
-		Iter:   iter,
-		FireAt: time.Now().Add(d).UnixMilli(),
-		Event:  r.event,
+		ID:          r.id,
+		Rule:        rule.Name,
+		Source:      rule.Source,
+		Step:        idx,
+		Iter:        iter,
+		FireAt:      time.Now().Add(step.After).UnixMilli(),
+		Fingerprint: step.Fingerprint,
+		Event:       r.event,
 	})
 	if err != nil {
 		// The step still runs; it just will not survive a restart. Saying so
@@ -397,33 +411,45 @@ func (rn *Runner) putRecord(r *run, idx, iter int, d time.Duration) {
 
 	rn.mu.Lock()
 	r.rec = true
+	r.recStep = idx
 	rn.mu.Unlock()
 }
 
+// pendingRef is the record a run holds, carried far enough that whoever
+// removes it can name the rule and step if the removal fails.
+type pendingRef struct {
+	id   string
+	rule string
+	step int
+}
+
 // claimRecordLocked takes the run's record, so exactly one caller ends up
-// responsible for removing it. It returns the empty string when there is
-// nothing to remove, which is the common case: most steps do not wait.
-func claimRecordLocked(r *run) string {
+// responsible for removing it. The returned id is empty when there is nothing
+// to remove, which is the common case: most steps do not wait.
+func claimRecordLocked(r *run) pendingRef {
 	if !r.rec {
-		return ""
+		return pendingRef{}
 	}
 	r.rec = false
-	return r.id
+	return pendingRef{id: r.id, rule: r.seq.Rule.Name, step: r.recStep}
 }
 
 // dropRecord removes a claimed record. Call it with the lock down.
-func (rn *Runner) dropRecord(id string) {
-	if id == "" || rn.store == nil {
+func (rn *Runner) dropRecord(ref pendingRef) {
+	if ref.id == "" || rn.store == nil {
 		return
 	}
-	if err := rn.store.Drop(id); err != nil {
-		rn.log.Printf("pending: %v", err)
+	if err := rn.store.Drop(ref.id); err != nil {
+		// The record stays, so the next start replays this step and its
+		// action runs a second time. On a vehicle this line is the only
+		// warning anyone gets, so it says which rule and what it costs.
+		rn.log.Printf("rule %s: step %d: %v; the record stays and this step runs again at next start", ref.rule, ref.step, err)
 	}
 }
 
-func (rn *Runner) dropRecords(ids []string) {
-	for _, id := range ids {
-		rn.dropRecord(id)
+func (rn *Runner) dropRecords(refs []pendingRef) {
+	for _, ref := range refs {
+		rn.dropRecord(ref)
 	}
 }
 
@@ -489,13 +515,13 @@ func (rn *Runner) end(r *run) {
 	var next *run
 
 	rn.mu.Lock()
-	ended, id := rn.endLocked(r)
+	ended, ref := rn.endLocked(r)
 	if ended {
 		next = rn.startQueuedLocked(r.seq.Rule.Name)
 	}
 	rn.mu.Unlock()
 
-	rn.dropRecord(id)
+	rn.dropRecord(ref)
 
 	if next != nil {
 		rn.advance(next)
@@ -519,9 +545,9 @@ func (rn *Runner) end(r *run) {
 // sequence finished wants the next queued trigger to start; one that ends it
 // because the rule was cancelled wants the queue gone. Only the caller knows
 // which, so promotion lives in end and the queue drop lives in CancelMatching.
-func (rn *Runner) endLocked(r *run) (ended bool, record string) {
+func (rn *Runner) endLocked(r *run) (ended bool, record pendingRef) {
 	if r.ended {
-		return false, ""
+		return false, pendingRef{}
 	}
 	r.ended = true
 	if r.cancelTail != nil {
@@ -575,11 +601,14 @@ func (rn *Runner) startQueuedLocked(name string) *run {
 // race a live re-fire of the same rule.
 //
 // A record is dropped, with a line saying why, when the rule it names is no
-// longer loaded, when the rule no longer has the step it indexes (its author
-// edited the file while the service was down), or when it is more than window
-// past due. That last one is the important limit: a scooter that was off for
-// a week must not come back up and start acting on what it was in the middle
-// of doing back then. Anything left is resumed on the run it belonged to,
+// longer loaded, when the rule no longer has the step it indexes, when the
+// step at that index is not the step the record was written for any more, or
+// when it is more than window past due. The middle two are one situation: a
+// user is free to edit their rule files while the service is down, and a
+// record whose step moved or was rewritten must not fire whatever took its
+// place. The last is the important limit: a scooter that was off for a week
+// must not come back up and start acting on what it was in the middle of
+// doing back then. Anything left is resumed on the run it belonged to,
 // keeping its id, so the record still covers it until it fires.
 func (rn *Runner) Replay(seqs []*Sequence, window time.Duration) int {
 	if rn.store == nil {
@@ -599,21 +628,28 @@ func (rn *Runner) Replay(seqs []*Sequence, window time.Duration) int {
 	now := time.Now()
 	n := 0
 	for _, p := range recs {
+		ref := pendingRef{id: p.ID, rule: p.Rule, step: p.Step}
+
 		s, ok := byName[p.Rule]
 		if !ok {
 			rn.log.Printf("pending %s: rule %s is not loaded any more, dropped", p.ID, p.Rule)
-			rn.dropRecord(p.ID)
+			rn.dropRecord(ref)
 			continue
 		}
 		if p.Step < 0 || p.Step >= len(s.Steps) {
 			rn.log.Printf("pending %s: rule %s has no step %d any more, dropped", p.ID, p.Rule, p.Step)
-			rn.dropRecord(p.ID)
+			rn.dropRecord(ref)
+			continue
+		}
+		if p.Fingerprint != s.Steps[p.Step].Fingerprint {
+			rn.log.Printf("pending %s: rule %s step %d is not the step this was recorded for any more, check %s, dropped", p.ID, p.Rule, p.Step, p.Source)
+			rn.dropRecord(ref)
 			continue
 		}
 		due := time.UnixMilli(p.FireAt)
 		if late := now.Sub(due); late > window {
 			rn.log.Printf("pending %s: rule %s step %d was due %v ago, past the %v window, dropped", p.ID, p.Rule, p.Step, late.Round(time.Second), window)
-			rn.dropRecord(p.ID)
+			rn.dropRecord(ref)
 			continue
 		}
 
@@ -638,8 +674,11 @@ func (rn *Runner) resume(s *Sequence, p Pending, remaining time.Duration) bool {
 		// claim; the index moves past it here the same way advance moves it
 		// past a step it is about to hand on.
 		step: p.Step + 1,
-		pass: p.Iter,
-		rec:  true,
+		// The pass the record was written on, so a repeating rule finishes
+		// the passes it had left rather than starting its count over.
+		pass:    p.Iter,
+		rec:     true,
+		recStep: p.Step,
 	}
 
 	rn.mu.Lock()

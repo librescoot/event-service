@@ -20,6 +20,38 @@ type Hasher interface {
 	HDel(key string, fields ...string) error
 }
 
+// Commander is what NewClientHasher needs from a datastore client: the two
+// hash operations the client has methods for, plus the raw command interface,
+// because it has no HDel of its own.
+type Commander interface {
+	HSet(key, field string, value any) error
+	HGetAll(key string) (map[string]string, error)
+	Do(cmd string, args ...any) (any, error)
+}
+
+// NewClientHasher adapts a datastore client to Hasher.
+func NewClientHasher(c Commander) Hasher { return clientHasher{c: c} }
+
+type clientHasher struct{ c Commander }
+
+func (h clientHasher) HSet(key, field string, value any) error {
+	return h.c.HSet(key, field, value)
+}
+
+func (h clientHasher) HGetAll(key string) (map[string]string, error) {
+	return h.c.HGetAll(key)
+}
+
+func (h clientHasher) HDel(key string, fields ...string) error {
+	args := make([]any, 0, len(fields)+1)
+	args = append(args, key)
+	for _, f := range fields {
+		args = append(args, f)
+	}
+	_, err := h.c.Do("HDEL", args...)
+	return err
+}
+
 // Pending is one step waiting out its after delay, written down so a service
 // restart during the wait does not lose it. Rule and Step are what replay
 // needs to find the step again; Iter is the repeat pass the run was on, so a
@@ -29,14 +61,21 @@ type Hasher interface {
 // FireAt is when the step is due, not when it was recorded: replay works out
 // the remaining delay from it, and drops a record too far past due to be
 // worth running.
+//
+// Fingerprint is what the step was configured to do when the record was
+// written. A user is free to edit their rule file while the service is down,
+// and Step is only an index: without the fingerprint, moving a step or
+// rewriting it would have the record fire whatever ended up at that index
+// instead.
 type Pending struct {
-	ID     string         `json:"id"`
-	Rule   string         `json:"rule"`
-	Source string         `json:"source"`
-	Step   int            `json:"step"`
-	Iter   int            `json:"iter"`
-	FireAt int64          `json:"fire-at"` // unix milliseconds
-	Event  eventbus.Event `json:"event"`
+	ID          string         `json:"id"`
+	Rule        string         `json:"rule"`
+	Source      string         `json:"source"`
+	Step        int            `json:"step"`
+	Iter        int            `json:"iter"`
+	FireAt      int64          `json:"fire-at"` // unix milliseconds
+	Fingerprint string         `json:"fingerprint"`
+	Event       eventbus.Event `json:"event"`
 }
 
 // PendingStore reads and writes the pending records. There is no sweep and no

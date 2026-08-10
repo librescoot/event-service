@@ -15,21 +15,51 @@ import (
 // memHash is an in-memory stand-in for the datastore hash. The runner and
 // replay tests use it rather than a live client so that "the record is gone"
 // is a fact the test reads directly, with no round trip to time out on.
+//
+// entered and release, when set, hold HSet open after it has written: the
+// value is in the hash and the caller has not been told so yet, which is the
+// window between a record being written and the run being marked as holding
+// it.
 type memHash struct {
 	mu sync.Mutex
 	m  map[string]map[string]string
+
+	entered chan string
+	release chan struct{}
 }
 
 func newMemHash() *memHash { return &memHash{m: make(map[string]map[string]string)} }
 
 func (h *memHash) HSet(key, field string, value any) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.m[key] == nil {
 		h.m[key] = make(map[string]string)
 	}
 	h.m[key][field] = fmt.Sprint(value)
+	entered, release := h.entered, h.release
+	h.mu.Unlock()
+
+	// Outside the lock on purpose: a test holding this open still has to be
+	// able to read the hash it is holding open.
+	if entered != nil {
+		entered <- field
+		<-release
+	}
 	return nil
+}
+
+// hold makes every later HSet write its value, hand the field name to the
+// returned channel and wait there until open is called. That parks a caller
+// inside putRecord with the record already in the hash and the run not yet
+// marked as holding it, which is the window a cancel or a shutdown has to be
+// driven into.
+func (h *memHash) hold() (entered <-chan string, open func()) {
+	release, open := newGate()
+	e := make(chan string)
+	h.mu.Lock()
+	h.entered, h.release = e, release
+	h.mu.Unlock()
+	return e, open
 }
 
 func (h *memHash) HGetAll(key string) (map[string]string, error) {
@@ -52,28 +82,6 @@ func (h *memHash) HDel(key string, fields ...string) error {
 		delete(h.m, key)
 	}
 	return nil
-}
-
-// liveHasher is the same surface over a real datastore client, which has no
-// HDel of its own.
-type liveHasher struct{ c *ipc.Client }
-
-func (h liveHasher) HSet(key, field string, value any) error {
-	return h.c.HSet(key, field, value)
-}
-
-func (h liveHasher) HGetAll(key string) (map[string]string, error) {
-	return h.c.HGetAll(key)
-}
-
-func (h liveHasher) HDel(key string, fields ...string) error {
-	args := make([]any, 0, len(fields)+1)
-	args = append(args, key)
-	for _, f := range fields {
-		args = append(args, f)
-	}
-	_, err := h.c.Do("HDEL", args...)
-	return err
 }
 
 // testHashName is unique per store, so two tests running at once, in the same
@@ -108,7 +116,8 @@ func liveStore(t *testing.T, log Logger) *PendingStore {
 
 	hash := testHashName(t)
 	t.Cleanup(func() { _, _ = client.Do("DEL", hash) })
-	return newPendingStoreIn(liveHasher{c: client}, log, hash)
+	// The same adapter main uses, so a fix to one is a fix to both.
+	return newPendingStoreIn(NewClientHasher(client), log, hash)
 }
 
 func memStore(t *testing.T, log Logger) (*PendingStore, *memHash) {
@@ -116,6 +125,11 @@ func memStore(t *testing.T, log Logger) (*PendingStore, *memHash) {
 	h := newMemHash()
 	return newPendingStoreIn(h, log, testHashName(t)), h
 }
+
+// fingerprintOf is what a record written for step idx of s carries. Seeding a
+// record by hand means seeding this too, or replay drops it as a record for a
+// step that has since been edited.
+func fingerprintOf(s *Sequence, idx int) string { return s.Steps[idx].Fingerprint }
 
 // capturingLog keeps every line, so a test can insist a dropped record said
 // so rather than vanishing quietly.
@@ -162,6 +176,32 @@ func countPending(t *testing.T, st *PendingStore) int {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// eventually reports whether cond became true inside d. Unlike waitFor it
+// does not fail the test, so a caller can say what a true and a false mean in
+// its own words, which matters where the interesting outcome is the negative
+// one.
+func eventually(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
+// waitEntered takes one field name from a held HSet, or fails the test rather
+// than blocking to the package timeout.
+func waitEntered(t *testing.T, entered <-chan string) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no record was written; the step under test is not durable")
+	}
+}
 
 func TestPutThenLoadRoundTripsAPending(t *testing.T) {
 	st := liveStore(t, nopLog{})
@@ -424,7 +464,135 @@ func TestCancellingADurableStepRemovesItsRecord(t *testing.T) {
 	if got := sch.Pending(); got != 0 {
 		t.Errorf("scheduler has %d pending fire(s) after the cancel, want 0", got)
 	}
-	waitFor(t, "the record to be removed", func() bool { return countPending(t, st) == 0 })
+	if !eventually(2*time.Second, func() bool { return countPending(t, st) == 0 }) {
+		t.Error("the record survived the cancel; it replays at the next start and re-fires a step the rider stopped on purpose")
+	}
+}
+
+// TestCancelWhileTheRecordIsBeingWrittenRemovesIt drives the window between
+// the record landing in the datastore and the run being marked as holding it.
+// A cancel arriving in there ends the run without finding a record to claim,
+// so whatever comes back to park the step is the last thing that can remove
+// it. Miss that and the rider's disarm leaves a record which replays the
+// deferred action at the next start.
+func TestCancelWhileTheRecordIsBeingWrittenRemovesIt(t *testing.T) {
+	st, h := memStore(t, nopLog{})
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "hazards", On: []string{"alarm.triggered"}, CancelOn: []string{"alarm.disarmed"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "1h"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("on"), rec.step("off"))
+
+	entered, open := h.hold()
+	defer open()
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), st, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+
+	waitEntered(t, entered)
+	if n := countPending(t, st); n != 1 {
+		t.Fatalf("%d record(s) while the write is held open, want 1", n)
+	}
+	if got := rn.CancelMatching("alarm.disarmed"); got != 1 {
+		t.Fatalf("CancelMatching returned %d, want 1", got)
+	}
+	open()
+
+	if !eventually(2*time.Second, func() bool { return countPending(t, st) == 0 }) {
+		t.Error("the record survived a cancel that landed while it was being written; nothing else will remove it, so it replays and re-fires the step at the next start")
+	}
+}
+
+// TestShutdownWhileTheRecordIsBeingWrittenKeepsIt is the same window from the
+// other side. A run ended by Stop has not run its step, so the record is the
+// only thing that will ever get it run.
+func TestShutdownWhileTheRecordIsBeingWrittenKeepsIt(t *testing.T) {
+	st, h := memStore(t, nopLog{})
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "hazards", On: []string{"alarm.triggered"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "30s"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("on"), rec.step("off"))
+
+	entered, open := h.hold()
+	defer open()
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), st, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+
+	waitEntered(t, entered)
+	rn.Stop()
+	open()
+
+	if eventually(300*time.Millisecond, func() bool { return countPending(t, st) == 0 }) {
+		t.Error("a shutdown landing while the record was being written removed it; the step never ran, so this is the hazards left on with nothing able to turn them off")
+	}
+}
+
+// TestARepeatPassRecordsTheIterationItIsOn: the pass number in the record is
+// what a replayed run resumes on. Record the wrong one and a rule that was
+// three chirps into five comes back up and does five more.
+func TestARepeatPassRecordsTheIterationItIsOn(t *testing.T) {
+	st, _ := memStore(t, nopLog{})
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "chirp", On: []string{"x.y"},
+		Repeat: &rules.RepeatConfig{Count: 3, Every: "1ms"},
+		Steps:  []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "60ms"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), st, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	// one, two of the first pass, then one of the second, which leaves the
+	// second pass parked on the durable step with its record written.
+	waitFor(t, "the second pass to park on its durable step", func() bool {
+		return len(rec.list()) == 3 && countPending(t, st) == 1
+	})
+
+	if got := loadAll(t, st)[0].Iter; got != 1 {
+		t.Errorf("the record written on the second pass says iter %d, want 1; a replay would restart the repeat and run the whole count over", got)
+	}
+}
+
+// TestReplayFinishesTheRepeatPassesTheRunHadLeft is the reading half. The
+// record was written on pass 1 of 3, so what is left is the rest of that pass
+// and one more, not three passes from the top.
+func TestReplayFinishesTheRepeatPassesTheRunHadLeft(t *testing.T) {
+	st, _ := memStore(t, nopLog{})
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "chirp", On: []string{"x.y"},
+		Repeat: &rules.RepeatConfig{Count: 3, Every: "5ms"},
+		Steps:  []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "20ms"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	if err := st.Put(Pending{
+		ID: "mid", Rule: "chirp", Step: 1, Iter: 1,
+		FireAt:      time.Now().Add(-time.Second).UnixMilli(),
+		Fingerprint: fingerprintOf(s, 1),
+		Event:       eventbus.Event{Topic: "x.y"},
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), st, nopLog{})
+	if n := rn.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
+		t.Fatalf("Replay resumed %d step(s), want 1", n)
+	}
+
+	waitFor(t, "the replayed run to end", func() bool { return rn.Active() == 0 })
+	// Long enough for a third and fourth pass to show up if the run came back
+	// believing it was on its first.
+	time.Sleep(60 * time.Millisecond)
+	want := []string{"two", "one", "two"}
+	if got := rec.list(); !equal(got, want) {
+		t.Errorf("steps ran as %v, want %v; a replayed run finishes the passes it had left rather than the whole count again", got, want)
+	}
 }
 
 // TestRestartDropsTheOldRunsRecord covers the fourth sink: a restart abandons
@@ -447,10 +615,12 @@ func TestRestartDropsTheOldRunsRecord(t *testing.T) {
 
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 	waitFor(t, "the restarted run to park on its tail", func() bool { return sch.Pending() == 1 })
-	waitFor(t, "the old record to be replaced", func() bool {
+	if !eventually(2*time.Second, func() bool {
 		got := loadAll(t, st)
 		return len(got) == 1 && got[0].ID != first
-	})
+	}) {
+		t.Errorf("records after a restart are %+v, want exactly one and not the abandoned run's %s", loadAll(t, st), first)
+	}
 }
 
 // TestStopLeavesTheRecordForReplay is the hazard this task exists for. A
@@ -476,34 +646,83 @@ func TestStopLeavesTheRecordForReplay(t *testing.T) {
 	}
 }
 
+// TestARecordWrittenByARunReplaysIntoANewRunner is the whole feature end to
+// end, and the only test where the record is written by a run rather than by
+// the test. One runner parks a durable step and goes away with the record
+// still in the hash, the way a service stopped mid-wait does; a second runner
+// over the same hash picks it up and finishes the sequence. Anything the
+// writing side leaves out of a record, a fingerprint above all, strands every
+// real record at the next start while every hand-seeded test still passes.
+func TestARecordWrittenByARunReplaysIntoANewRunner(t *testing.T) {
+	st, _ := memStore(t, nopLog{})
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "hazards", On: []string{"alarm.triggered"},
+		Steps: []rules.StepConfig{
+			push("a", "1"),
+			{Do: "redis", List: "b", Push: "2", After: "80ms"},
+			push("c", "3"),
+		},
+	}, nil)
+	s := seqWith(t, r, rec.step("on"), rec.step("off"), rec.step("after"))
+
+	first := NewRunner(startedPool(t, 1, 8), testSched(t), st, nopLog{})
+	first.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+	waitFor(t, "the first runner to park on its durable step", func() bool { return countPending(t, st) == 1 })
+	first.Stop()
+
+	if got := rec.list(); !equal(got, []string{"on"}) {
+		t.Fatalf("steps ran as %v before the restart, want only on", got)
+	}
+
+	second := NewRunner(startedPool(t, 1, 8), testSched(t), st, nopLog{})
+	if n := second.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
+		t.Fatalf("Replay resumed %d step(s), want 1; a record a run wrote must be one a start can read", n)
+	}
+
+	waitFor(t, "the resumed run to end", func() bool { return second.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"on", "off", "after"}) {
+		t.Errorf("steps ran as %v, want on, off, after", got)
+	}
+	if n := countPending(t, st); n != 0 {
+		t.Errorf("%d record(s) once the resumed run ended, want 0", n)
+	}
+}
+
 // TestQueuedTriggersAreNotPersisted pins the ruling: a queue-policy backlog is
 // memory only. A trigger that never started a run has latched nothing, and
 // replaying a burst of them on boot would fire hardware against a vehicle
 // state that has moved on.
+// The rule's second step is durable on purpose, so the live run does hold a
+// record and "one record, whatever the backlog" is a real distinction rather
+// than an empty hash that would hold however the runner behaved.
 func TestQueuedTriggersAreNotPersisted(t *testing.T) {
-	gate, open := newGate()
-	defer open()
 	st, _ := memStore(t, nopLog{})
 	rec := &recorder{}
 	r := compileRule(t, rules.RuleConfig{
 		Name: "r", On: []string{"x.y"}, Concurrency: "queue",
-		Steps: []rules.StepConfig{push("a", "1")},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "1h"}},
 	}, nil)
-	s := seqWith(t, r, rec.gated("run", gate))
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
 	rn := NewRunner(startedPool(t, 1, 8), testSched(t), st, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
-	waitFor(t, "the first run to start", func() bool { return len(rec.list()) == 1 })
-	rn.Fire(s, eventbus.Event{Topic: "x.y"})
-	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	waitFor(t, "the live run to park on its durable step", func() bool { return countPending(t, st) == 1 })
 
-	if n := countPending(t, st); n != 0 {
-		t.Errorf("%d record(s) written for a queued backlog, want 0", n)
+	for i := 0; i < 3; i++ {
+		rn.Fire(s, eventbus.Event{Topic: "x.y"})
 	}
-	open()
-	waitFor(t, "the backlog to drain", func() bool { return len(rec.list()) == 3 })
-	if n := countPending(t, st); n != 0 {
-		t.Errorf("%d record(s) once the backlog drained, want 0", n)
+
+	// Long enough for a runner that recorded its backlog to have done so.
+	time.Sleep(30 * time.Millisecond)
+	if n := countPending(t, st); n != 1 {
+		t.Errorf("%d record(s) with three triggers queued behind a parked run, want 1: the live run's own", n)
+	}
+	if got := rn.Active(); got != 1 {
+		t.Errorf("Active() = %d, want 1; the other three are queued, not running", got)
+	}
+	if got := loadAll(t, st)[0].Step; got != 1 {
+		t.Errorf("the one record names step %d, want 1: the step the live run is parked on", got)
 	}
 }
 
@@ -529,7 +748,8 @@ func TestReplayDropsEntriesOlderThanTheWindow(t *testing.T) {
 
 	if err := st.Put(Pending{
 		ID: "old", Rule: "hazards", Step: 1,
-		FireAt: time.Now().Add(-10 * time.Minute).UnixMilli(),
+		FireAt:      time.Now().Add(-10 * time.Minute).UnixMilli(),
+		Fingerprint: fingerprintOf(s, 1),
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -616,6 +836,105 @@ func TestReplayDropsEntriesWhoseStepIndexNoLongerExists(t *testing.T) {
 	}
 }
 
+// TestReplayDropsAnEntryWhoseStepHasChanged: the record names a step by
+// index, and a user is free to reorder or rewrite their steps while the
+// service is down. The seeded fingerprint is a real one, taken from a rule
+// whose step 1 pushes something else, so the check has to compare what the
+// step does rather than just notice a missing value.
+func TestReplayDropsAnEntryWhoseStepHasChanged(t *testing.T) {
+	log := &capturingLog{}
+	st, _ := memStore(t, log)
+	rec := &recorder{}
+	s := replaySeq(t, rec)
+
+	edited := compileRule(t, rules.RuleConfig{
+		Name: "hazards", On: []string{"alarm.triggered"},
+		Steps: []rules.StepConfig{
+			push("a", "1"),
+			{Do: "redis", List: "b", Push: "something-else", After: "1h"},
+			push("c", "3"),
+		},
+	}, nil)
+	before, err := Build(edited, nopPusher{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if err := st.Put(Pending{
+		ID: "stale", Rule: "hazards", Step: 1, Source: "hazards.toml",
+		FireAt:      time.Now().Add(-time.Minute).UnixMilli(),
+		Fingerprint: fingerprintOf(before, 1),
+		Event:       eventbus.Event{Topic: "alarm.triggered"},
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, st, log)
+	if n := rn.Replay([]*Sequence{s}, 5*time.Minute); n != 0 {
+		t.Errorf("Replay resumed %d step(s), want 0; the step at that index is not the one the record was written for", n)
+	}
+	if n := countPending(t, st); n != 0 {
+		t.Errorf("%d record(s) left for an edited step, want 0", n)
+	}
+	if got := sch.Pending(); got != 0 {
+		t.Errorf("scheduler has %d pending fire(s), want 0", got)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := rec.list(); len(got) != 0 {
+		t.Errorf("steps ran as %v, want none; an edited step must not be fired by an old record", got)
+	}
+	if !log.contains("hazards.toml") {
+		t.Errorf("the drop should point at the file to look in, got:\n%s", log.all())
+	}
+}
+
+// TestAReplayWindowOfZeroReplaysOnlyWhatIsStillInTheFuture pins the flag's
+// edge: at or below zero, nothing past due is run and a step still waiting
+// out its delay is kept.
+func TestAReplayWindowOfZeroReplaysOnlyWhatIsStillInTheFuture(t *testing.T) {
+	log := &capturingLog{}
+	st, _ := memStore(t, log)
+	rec := &recorder{}
+	s := replaySeq(t, rec)
+
+	now := time.Now()
+	for id, at := range map[string]time.Time{
+		"past":   now.Add(-50 * time.Millisecond),
+		"future": now.Add(80 * time.Millisecond),
+	} {
+		if err := st.Put(Pending{
+			ID: id, Rule: "hazards", Step: 1,
+			FireAt:      at.UnixMilli(),
+			Fingerprint: fingerprintOf(s, 1),
+			Event:       eventbus.Event{Topic: "alarm.triggered"},
+		}); err != nil {
+			t.Fatalf("Put %s: %v", id, err)
+		}
+	}
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, st, log)
+	if n := rn.Replay([]*Sequence{s}, 0); n != 1 {
+		t.Errorf("Replay resumed %d step(s) with a zero window, want 1: the one still in the future", n)
+	}
+	if got := sch.Pending(); got != 1 {
+		t.Errorf("scheduler has %d pending fire(s), want 1", got)
+	}
+	got := loadAll(t, st)
+	if len(got) != 1 || got[0].ID != "future" {
+		t.Fatalf("records after a zero-window replay are %+v, want only future", got)
+	}
+	if !log.contains("past") {
+		t.Errorf("the dropped past-due record must be logged, got:\n%s", log.all())
+	}
+
+	waitFor(t, "the future record to run", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"two", "three"}) {
+		t.Errorf("steps ran as %v, want two, three; only the future record replays", got)
+	}
+}
+
 // TestReplayFiresAPastDueEntryWithinTheWindowImmediately gives the recorded
 // step an hour-long after, so a replay that re-parked for the step's own delay
 // instead of firing what is already due would run nothing at all.
@@ -627,8 +946,9 @@ func TestReplayFiresAPastDueEntryWithinTheWindowImmediately(t *testing.T) {
 
 	if err := st.Put(Pending{
 		ID: "due", Rule: "hazards", Step: 1,
-		FireAt: time.Now().Add(-time.Minute).UnixMilli(),
-		Event:  eventbus.Event{Topic: "alarm.triggered"},
+		FireAt:      time.Now().Add(-time.Minute).UnixMilli(),
+		Fingerprint: fingerprintOf(s, 1),
+		Event:       eventbus.Event{Topic: "alarm.triggered"},
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -662,8 +982,9 @@ func TestReplayReschedulesAFutureEntryWithTheRemainingDelay(t *testing.T) {
 
 	if err := st.Put(Pending{
 		ID: "later", Rule: "hazards", Step: 1,
-		FireAt: time.Now().Add(80 * time.Millisecond).UnixMilli(),
-		Event:  eventbus.Event{Topic: "alarm.triggered"},
+		FireAt:      time.Now().Add(80 * time.Millisecond).UnixMilli(),
+		Fingerprint: fingerprintOf(s, 1),
+		Event:       eventbus.Event{Topic: "alarm.triggered"},
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}

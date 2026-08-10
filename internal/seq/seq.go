@@ -32,11 +32,15 @@ type Sequence struct {
 // long before it is submitted. Durable, which only a step with After can be,
 // puts that pending fire in the datastore so a restart during the wait can
 // pick it up again.
+// Fingerprint identifies what the step was configured to do, so a record
+// written for it can be told apart from a record written for whatever now
+// sits at the same index.
 type CompiledStep struct {
-	Action  action.Action
-	When    *vm.Program
-	After   time.Duration
-	Durable bool
+	Action      action.Action
+	When        *vm.Program
+	After       time.Duration
+	Durable     bool
+	Fingerprint string
 }
 
 // Build compiles every step of r. An error names the step index; the caller
@@ -55,7 +59,13 @@ func Build(r *rules.Rule, c action.Pusher) (*Sequence, error) {
 		if err != nil {
 			return nil, fmt.Errorf("step %d: %w", i, err)
 		}
-		s.Steps = append(s.Steps, CompiledStep{Action: a, When: step.When, After: step.After, Durable: step.Durable})
+		s.Steps = append(s.Steps, CompiledStep{
+			Action:      a,
+			When:        step.When,
+			After:       step.After,
+			Durable:     step.Durable,
+			Fingerprint: step.Fingerprint,
+		})
 	}
 
 	return s, nil

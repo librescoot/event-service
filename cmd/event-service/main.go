@@ -22,29 +22,6 @@ import (
 
 var version = "dev"
 
-// pendingHash gives the pending store the three hash operations it asks for.
-// The client has no HDel of its own, so that one goes through the raw command
-// interface.
-type pendingHash struct{ c *ipc.Client }
-
-func (h pendingHash) HSet(key, field string, value any) error {
-	return h.c.HSet(key, field, value)
-}
-
-func (h pendingHash) HGetAll(key string) (map[string]string, error) {
-	return h.c.HGetAll(key)
-}
-
-func (h pendingHash) HDel(key string, fields ...string) error {
-	args := make([]any, 0, len(fields)+1)
-	args = append(args, key)
-	for _, f := range fields {
-		args = append(args, f)
-	}
-	_, err := h.c.Do("HDEL", args...)
-	return err
-}
-
 func main() {
 	var (
 		redisAddr = flag.String("redis", "localhost:6379", "datastore address")
@@ -52,7 +29,7 @@ func main() {
 		rulesDir  = flag.String("rules-dir", "/data/extensions", "directory of rule TOML files")
 		workers   = flag.Int("workers", 2, "action worker count")
 		queue     = flag.Int("queue", 256, "action queue depth")
-		replayWin = flag.Duration("replay-window", 5*time.Minute, "how far past due a recorded step may be and still run at start")
+		replayWin = flag.Duration("replay-window", 5*time.Minute, "how far past due a recorded step may be and still run at start; zero or less replays only steps still in the future")
 	)
 	flag.Parse()
 
@@ -109,7 +86,7 @@ func main() {
 	pool.Start()
 	defer pool.Stop()
 
-	store := seq.NewPendingStore(pendingHash{c: client}, log.Default())
+	store := seq.NewPendingStore(seq.NewClientHasher(client), log.Default())
 
 	en, buildErrs := engine.New(compiled, pool, sch, store, client, log.Default())
 	for _, err := range buildErrs {

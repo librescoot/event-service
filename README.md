@@ -82,10 +82,18 @@ the wait does not strand the vehicle half-changed: "hazards on, hazards off
 thirty seconds later" still turns them off if the service goes down at second
 five. On start, a recorded step whose delay has run out is run straight away
 and one still in the future waits out what is left of it, both before the
-first event is handled. A record is thrown away instead, with a line saying
-why, if its rule is gone, if its rule no longer has that step, or if it is
-more than `--replay-window` (5 minutes by default) past due: a scooter that
-was off for a week must not come back up acting on what it was doing then.
+first event is handled. A rule with `repeat` comes back on the pass it was on
+and finishes the passes it had left, rather than starting its count over.
+
+A record is thrown away instead, with a line saying why, if its rule is gone,
+if its rule no longer has that step, if the step at that index is not the one
+the record was written for any more, or if it is more than `--replay-window`
+(5 minutes by default) past due. Editing a rule file while the service is down
+is expected, and a record identifies its step by what that step was configured
+to do, so reordering or rewriting steps drops the record rather than firing
+whatever ended up at the same index. A window of zero or less replays only
+what is still in the future: a scooter that was off for a week must not come
+back up acting on what it was doing then.
 Write `durable = false` on the step to opt out, and note that nothing is
 recorded for a `repeat` gap or for a trigger sitting in a `queue` backlog:
 neither has acted on the vehicle yet. `durable` on a step without `after`
