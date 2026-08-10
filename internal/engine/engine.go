@@ -40,10 +40,6 @@ func New(rs []*rules.Rule, pool *action.Pool, c action.Pusher, log Logger) (*Eng
 	var errs []error
 
 	for _, r := range rs {
-		if r.Debounce > 0 {
-			errs = append(errs, fmt.Errorf("rule %q: debounce is not supported yet", r.Name))
-			continue
-		}
 		a, err := action.Build(action.Spec{
 			Do:      r.Step.Do,
 			List:    r.Step.List,
@@ -52,7 +48,7 @@ func New(rs []*rules.Rule, pool *action.Pool, c action.Pusher, log Logger) (*Eng
 			Timeout: r.Step.Timeout,
 		}, c)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("rule %q in %s: %w", r.Name, r.Source, err))
 			continue
 		}
 		en.bounds = append(en.bounds, &bound{rule: r, action: a})

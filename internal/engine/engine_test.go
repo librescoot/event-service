@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -173,19 +174,25 @@ func TestNewReportsUnbuildableRuleWithoutLosingTheRest(t *testing.T) {
 	}
 }
 
-// TestNewRejectsDebounceRule guards the deliberate gap in this task: Debounce
-// is parsed by rules.Compile but has no timer implementation here. Without
-// this rejection, a rule author writing debounce would get a rule that
-// silently behaves as if debounce were zero.
-func TestNewRejectsDebounceRule(t *testing.T) {
+// TestNewErrorNamesRuleAndFile guards finding 3: with several rule files
+// installed, an error that names neither the rule nor the file leaves the
+// user unable to tell which of their files to fix. rules.Rule.Source is set
+// directly here rather than via rules.Load, since Source is a plain field
+// and Load's file-tagging behaviour already has its own tests in the rules
+// package.
+func TestNewErrorNamesRuleAndFile(t *testing.T) {
 	rs := compileRules(t, rules.RuleConfig{
-		Name: "r", On: []string{"x.y"}, Debounce: "500ms", Steps: []rules.StepConfig{horn()},
+		Name: "bad", Source: "horn.toml", On: []string{"x.y"}, Steps: []rules.StepConfig{{Do: "telepathy"}},
 	})
-	en, errs := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
+	_, errs := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
 	if len(errs) != 1 {
 		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
 	}
-	if n := en.RuleCount(); n != 0 {
-		t.Errorf("RuleCount() = %d, want 0; a debounce rule must not become live", n)
+	msg := errs[0].Error()
+	if !strings.Contains(msg, "bad") {
+		t.Errorf("error should name the rule, got %q", msg)
+	}
+	if !strings.Contains(msg, "horn.toml") {
+		t.Errorf("error should name the file, got %q", msg)
 	}
 }
