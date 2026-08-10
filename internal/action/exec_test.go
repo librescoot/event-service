@@ -144,6 +144,64 @@ func TestExecActionKillsBackgroundedChildren(t *testing.T) {
 	}
 }
 
+// TestExecActionKillsOnParentContextCancel proves that canceling the context
+// passed into Do kills the script immediately, independent of the action's
+// own timeout: the timeout here is a full minute, so if Do only reacted to
+// its own deadline this test would hang. This is what lets Pool.Stop bound
+// shutdown regardless of what timeout a rule configured.
+func TestExecActionKillsOnParentContextCancel(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	script := writeScript(t, "echo $$ > "+pidFile+"\nsleep 30\n")
+	a, _ := NewExecAction(script, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Do(ctx, eventbus.Event{Topic: "x.y"}) }()
+
+	startDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(pidFile); err == nil {
+			break
+		}
+		if time.Now().After(startDeadline) {
+			t.Fatal("script never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a canceled parent context must surface as an error from Do")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Do did not return after the parent context was canceled")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("took %v to react to cancellation; want well under the 1m timeout", elapsed)
+	}
+
+	pidBytes, readErr := os.ReadFile(pidFile)
+	if readErr != nil {
+		t.Fatalf("read pid file: %v", readErr)
+	}
+	pid, convErr := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if convErr != nil {
+		t.Fatalf("parse pid: %v", convErr)
+	}
+
+	killDeadline := time.Now().Add(2 * time.Second)
+	for processAlive(pid) && time.Now().Before(killDeadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if processAlive(pid) {
+		t.Errorf("pid %d is still alive after parent context cancellation", pid)
+	}
+}
+
 func processAlive(pid int) bool {
 	_, err := os.Stat("/proc/" + strconv.Itoa(pid))
 	return err == nil

@@ -62,6 +62,13 @@ type Pool struct {
 	log     Logger
 	wg      sync.WaitGroup
 
+	// runCtx is passed to every Action.Do call and is canceled by Stop. This
+	// is what lets Stop reach into a running exec action's own
+	// context.WithTimeout and cut it short instead of waiting the timeout
+	// out: canceling a parent context cancels every context derived from it.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
 	dispatched atomic.Uint64
 	dropped    atomic.Uint64
 	failed     atomic.Uint64
@@ -80,7 +87,15 @@ func NewPool(workers, queue int, log Logger) *Pool {
 	if queue < 1 {
 		queue = 1
 	}
-	return &Pool{jobs: make(chan job, queue), done: make(chan struct{}), workers: workers, log: log}
+	runCtx, runCancel := context.WithCancel(context.Background())
+	return &Pool{
+		jobs:      make(chan job, queue),
+		done:      make(chan struct{}),
+		workers:   workers,
+		log:       log,
+		runCtx:    runCtx,
+		runCancel: runCancel,
+	}
 }
 
 // Start launches the workers.
@@ -98,10 +113,21 @@ func (p *Pool) startWorkers() {
 func (p *Pool) run() {
 	defer p.wg.Done()
 	for {
+		// A stopping pool must notice promptly rather than pseudo-randomly
+		// picking up another queued job first: select does not prioritise
+		// between two ready cases, so without this check a worker that
+		// finishes a job just after Stop is called has even odds of pulling
+		// the next one off jobs instead of returning.
+		select {
+		case <-p.done:
+			return
+		default:
+		}
+
 		select {
 		case j := <-p.jobs:
 			p.dispatched.Add(1)
-			if err := j.action.Do(context.Background(), j.event); err != nil {
+			if err := j.action.Do(p.runCtx, j.event); err != nil {
 				p.failed.Add(1)
 				p.log.Printf("rule %s: %s action failed: %v", j.rule, j.action.Kind(), err)
 			}
@@ -132,18 +158,40 @@ func (p *Pool) Submit(a Action, e eventbus.Event, rule string) bool {
 		p.log.Printf("rule %s: pool stopped, dropped", rule)
 		return false
 	default:
+		// Deviation from the design: the design calls for dropping the
+		// oldest queued job on overflow, keeping the incoming one. This
+		// drops the incoming job instead, keeping whatever is already
+		// queued. Noted here rather than changed, because for a
+		// state-change trigger the newest event is usually the
+		// semantically interesting one, so changing this is a real
+		// behaviour question, not a typo fix.
 		p.dropped.Add(1)
 		p.log.Printf("rule %s: action queue full, dropped", rule)
 		return false
 	}
 }
 
-// Stop signals the workers to exit and waits for in-flight work to finish.
-// It never closes jobs, so a Submit racing with Stop always has a live
-// channel to select on.
+// Stop signals the workers to exit, cancels the context passed to every
+// running action, and waits for them to return. It never closes jobs, so a
+// Submit racing with Stop always has a live channel to select on.
+//
+// Canceling runCtx is what keeps shutdown bounded: without it, an exec action
+// mid-timeout would run to the end of its own timeout before Stop could
+// return, and systemd would SIGKILL the process out from under it once
+// TimeoutStopUSec expired.
+//
+// Whatever is still sitting in jobs once every worker has exited was never
+// going to run; it is abandoned, not merely delayed, so it is counted into
+// Dropped here rather than left invisible.
 func (p *Pool) Stop() {
-	p.stopOnce.Do(func() { close(p.done) })
+	p.stopOnce.Do(func() {
+		close(p.done)
+		p.runCancel()
+	})
 	p.wg.Wait()
+	if remaining := len(p.jobs); remaining > 0 {
+		p.dropped.Add(uint64(remaining))
+	}
 }
 
 // Stats returns a snapshot of the counters.

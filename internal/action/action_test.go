@@ -3,6 +3,7 @@ package action
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,6 +158,105 @@ func TestSubmitAfterStopReturnsFalseWithoutPanic(t *testing.T) {
 	}
 	if s := p.Stats(); s.Dropped == 0 {
 		t.Error("Dropped must count a post-Stop submission")
+	}
+}
+
+// TestStopCancelsRunningActionsContext proves Stop reaches a running action
+// through its context rather than merely waiting it out: an action that
+// watches ctx.Done() and returns must make Stop return quickly, even though
+// the action would otherwise run forever. Without Pool wiring runCtx through
+// to Do, this test hangs until the outer test timeout instead of passing.
+func TestStopCancelsRunningActionsContext(t *testing.T) {
+	started := make(chan struct{})
+	var sawCancel atomic.Bool
+
+	p := NewPool(1, 4, nopLog{})
+	p.Start()
+
+	p.Submit(actionFunc(func(ctx context.Context, e eventbus.Event) error {
+		close(started)
+		<-ctx.Done()
+		sawCancel.Store(true)
+		return ctx.Err()
+	}), eventbus.Event{Topic: "x.y"}, "r")
+
+	<-started
+
+	stopReturned := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(stopReturned)
+	}()
+
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return; a hung action must be canceled, not waited out")
+	}
+
+	if !sawCancel.Load() {
+		t.Error("the running action's context was never canceled")
+	}
+}
+
+// TestStopCountsAbandonedQueuedJobsAsDropped proves that jobs still sitting
+// in the queue when every worker has exited are counted into Dropped, not
+// silently discarded. The sole worker is pinned on a job that ignores ctx
+// (representative of an action that does not itself watch for cancellation),
+// so the three jobs behind it in the queue are never dispatched.
+func TestStopCountsAbandonedQueuedJobsAsDropped(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	p := NewPool(1, 4, nopLog{})
+	p.Start()
+
+	p.Submit(actionFunc(func(ctx context.Context, e eventbus.Event) error {
+		close(started)
+		<-release
+		return nil
+	}), eventbus.Event{Topic: "x.y"}, "r")
+	<-started
+
+	noop := actionFunc(func(ctx context.Context, e eventbus.Event) error { return nil })
+	for i := 0; i < 3; i++ {
+		if !p.Submit(noop, eventbus.Event{Topic: "x.y"}, "r") {
+			t.Fatalf("submit %d was refused with a free queue", i)
+		}
+	}
+
+	stopReturned := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(stopReturned)
+	}()
+
+	// Wait for Stop to have signalled done before releasing the pinned
+	// worker, so the worker's done pre-check sees a pool that is already
+	// stopping and does not go on to drain the queue.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		select {
+		case <-p.done:
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("Stop never signalled done")
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		break
+	}
+	close(release)
+
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return")
+	}
+
+	if s := p.Stats(); s.Dropped != 3 {
+		t.Errorf("Dropped = %d, want 3 abandoned queued jobs", s.Dropped)
 	}
 }
 
