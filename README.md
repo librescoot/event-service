@@ -70,16 +70,45 @@ and evaluated against the event that triggered the rule, with `state()`
 reading whatever is current at that moment. A false step `when` ends the run
 cleanly; it does not skip ahead to the next step.
 
-Not supported yet: `after`, `concurrency`, `cancel-on`, `repeat`, `debounce`,
-and the `can`, `lua`, and `http` step kinds. A rule using any of these fails
-to load rather than silently doing nothing. The error always names the rule
-and the file; where the offending key belongs to a step (`after`, and any
-problem with a step's `do` or `when`) it also names the step index.
-`concurrency`, `cancel-on`, `repeat` and `debounce` sit on the rule itself,
-so their errors have no step to name. This includes writing the empty
-form of a feature (`cancel-on = []`, `repeat = {}`, `debounce = "0s"`): the
-key being present is what is rejected, not whether its value would have done
-anything.
+A step can also carry `after` (a duration), which runs it that long after the
+step before it finished. A step waiting out its delay holds no worker and no
+thread: it sits on a timer, so a rule can say "and thirty seconds later, turn
+it off" without occupying anything for thirty seconds.
+
+`concurrency` decides what a fresh trigger does to a run of the same rule that
+has not finished yet:
+
+- `restart`, the default and what an omitted key means: drop the pending tail
+  of the live run and start the sequence over.
+- `drop`: ignore the trigger while a run is live. The rule fires again
+  normally once that run has ended.
+- `queue`: hold the trigger and run the sequence again once the live run has
+  finished, so runs go back to back rather than side by side. The backlog is
+  capped at 8 per rule; triggers past that are refused, counted and logged,
+  because an unbounded queue behind a flapping trigger is a memory leak.
+
+`cancel-on` takes topics in the same form as `on`, and an event matching one
+of them drops every live run of that rule: pending timers are cancelled, the
+queued backlog is thrown away, and no further step is submitted. It is applied
+before matching, so a single event can cancel one rule and fire another, which
+is how "blink the hazards, stop 30s later" is made to stop early when the
+rider disarms at second five.
+
+A step that is already executing when the cancel arrives is **not**
+interrupted. The worker owns it and runs it to its end; a `redis` push or an
+`exec` command in flight will complete. What cancelling guarantees is that
+nothing after that step runs.
+
+Not supported yet: `repeat`, `debounce`, and the `can`, `lua`, and `http` step
+kinds. A rule using any of these fails to load rather than silently doing
+nothing. The error always names the rule and the file; where the offending key
+belongs to a step (`after`, and any problem with a step's `do` or `when`) it
+also names the step index. `repeat` and `debounce` sit on the rule itself, so
+their errors have no step to name. This includes writing the empty form of a
+feature (`repeat = {}`, `debounce = "0s"`): the key being present is what is
+rejected, not whether its value would have done anything. An unrecognised
+`concurrency` is rejected the same way, naming the rule, the file and the
+three values it accepts.
 
 `durable` is not a recognised key at all, on either a rule or a step, and
 neither is any key not listed above. A file containing one fails to load: the

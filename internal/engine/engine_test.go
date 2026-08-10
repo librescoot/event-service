@@ -223,6 +223,76 @@ func TestPatternsCoverEveryRuleTopic(t *testing.T) {
 	}
 }
 
+// TestPatternsIncludesCancelOnTopics guards the failure this feature is one
+// mistake away from: a topic named only in cancel-on is never subscribed, the
+// cancelling event never reaches Handle, and the cancel quietly never happens
+// on a real scooter while every test that calls Handle directly still passes.
+func TestPatternsIncludesCancelOnTopics(t *testing.T) {
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "a", On: []string{"alarm.triggered"}, CancelOn: []string{"alarm.disarmed", "vehicle.*"},
+		Steps: []rules.StepConfig{horn()},
+	})
+	en, _ := New(rs, action.NewPool(1, 1, nopLog{}), testSched(t), &countingPusher{}, nopLog{})
+
+	got := en.Patterns()
+	want := map[string]bool{"ev:alarm.triggered": false, "ev:alarm.disarmed": false, "ev:vehicle.*": false}
+	for _, p := range got {
+		if _, ok := want[p]; !ok {
+			t.Errorf("unexpected pattern %q", p)
+		}
+		want[p] = true
+	}
+	for p, seen := range want {
+		if !seen {
+			t.Errorf("missing pattern %q (got %v)", p, got)
+		}
+	}
+}
+
+// TestOneEventCanCancelOneRuleAndFireAnother is the shape the motivating rule
+// pair has: one rule reacts to the alarm, another reacts to the rider
+// disarming it, and the disarm has to do both jobs.
+func TestOneEventCanCancelOneRuleAndFireAnother(t *testing.T) {
+	p := &recordingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	rs := compileRules(t,
+		rules.RuleConfig{
+			Name: "hazards", On: []string{"alarm.triggered"}, CancelOn: []string{"alarm.disarmed"},
+			Steps: []rules.StepConfig{
+				{Do: "redis", List: "scooter:blinker", Push: "both"},
+				{Do: "redis", List: "scooter:blinker", Push: "off", After: "1h"},
+			},
+		},
+		rules.RuleConfig{
+			Name: "chirp", On: []string{"alarm.disarmed"},
+			Steps: []rules.StepConfig{{Do: "redis", List: "scooter:horn", Push: "short"}},
+		},
+	)
+	sch := testSched(t)
+	en, errs := New(rs, pool, sch, p, nopLog{})
+	if len(errs) != 0 {
+		t.Fatalf("New: %v", errs)
+	}
+	defer en.Stop()
+
+	en.Handle(eventbus.Event{Topic: "alarm.triggered"})
+	waitFor(t, func() bool { return sch.Pending() == 1 })
+
+	en.Handle(eventbus.Event{Topic: "alarm.disarmed"})
+	waitFor(t, func() bool { return len(p.list()) == 2 })
+
+	if got := sch.Pending(); got != 0 {
+		t.Errorf("scheduler has %d pending fire(s) after the disarm, want 0; the cancelled tail must be dropped", got)
+	}
+	want := []string{"scooter:blinker=both", "scooter:horn=short"}
+	if got := p.list(); got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("pushes were %v, want %v; one event cancels one rule and fires another", got, want)
+	}
+}
+
 func TestNewReportsUnbuildableRuleWithoutLosingTheRest(t *testing.T) {
 	rs := compileRules(t,
 		rules.RuleConfig{Name: "good", On: []string{"x.y"}, Steps: []rules.StepConfig{horn()}},

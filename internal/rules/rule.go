@@ -14,15 +14,34 @@ import (
 // something the event itself does not carry, without any datastore round trip.
 type StateFunc func(hash, field string) string
 
+// Policy decides what a trigger does to a run of the same rule that has not
+// finished yet.
+type Policy string
+
+const (
+	// PolicyRestart drops the pending tail of the live run and starts the
+	// sequence over. It is what an omitted concurrency means, because a rule
+	// that keeps triggering usually wants its timer pushed back rather than a
+	// second copy of itself.
+	PolicyRestart Policy = "restart"
+	// PolicyDrop ignores the trigger while a run is live.
+	PolicyDrop Policy = "drop"
+	// PolicyQueue holds the trigger until the live run has finished, then
+	// runs the sequence again.
+	PolicyQueue Policy = "queue"
+)
+
 // Rule is a compiled rule, ready to match. The expression is compiled once at
 // load, so matching is a VM run over a small map with no allocation-heavy
 // reflection and no I/O.
 type Rule struct {
-	Name     string
-	Source   string
-	On       []string
-	Cooldown time.Duration
-	Steps    []Step
+	Name        string
+	Source      string
+	On          []string
+	CancelOn    []string
+	Concurrency Policy
+	Cooldown    time.Duration
+	Steps       []Step
 
 	program *vm.Program
 	state   StateFunc
@@ -71,16 +90,10 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 	if len(c.Steps) == 0 {
 		return nil, fmt.Errorf("missing step")
 	}
-	if c.Concurrency != "" {
-		return nil, fmt.Errorf("concurrency is not supported yet")
-	}
-	// Presence, not truthiness: cancel-on = [] and repeat = {} both decode to
-	// a non-nil, zero-length value, distinguishable from an omitted key by
-	// nil-ness alone. A rule author who wrote either meant to use the
-	// feature and must see the same rejection as the non-empty form.
-	if c.CancelOn != nil {
-		return nil, fmt.Errorf("cancel-on is not supported yet")
-	}
+	// Presence, not truthiness: repeat = {} decodes to a non-nil, zero-length
+	// value, distinguishable from an omitted key by nil-ness alone. A rule
+	// author who wrote it meant to use the feature and must see the same
+	// rejection as the non-empty form.
 	if c.Repeat != nil {
 		return nil, fmt.Errorf("repeat is not supported yet")
 	}
@@ -88,15 +101,21 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 		return nil, fmt.Errorf("debounce is not supported yet")
 	}
 
-	r := &Rule{
-		Name:   c.Name,
-		Source: c.Source,
-		On:     c.On,
-		Steps:  make([]Step, 0, len(c.Steps)),
-		state:  lookup,
+	policy, err := parsePolicy(c.Concurrency)
+	if err != nil {
+		return nil, err
 	}
 
-	var err error
+	r := &Rule{
+		Name:        c.Name,
+		Source:      c.Source,
+		On:          c.On,
+		CancelOn:    c.CancelOn,
+		Concurrency: policy,
+		Steps:       make([]Step, 0, len(c.Steps)),
+		state:       lookup,
+	}
+
 	if r.Cooldown, err = parseDuration(c.Cooldown); err != nil {
 		return nil, fmt.Errorf("cooldown: %w", err)
 	}
@@ -140,6 +159,20 @@ func compileWhen(src string) (*vm.Program, error) {
 	return expr.Compile(src, expr.Env(exprEnv{}), expr.AsBool())
 }
 
+// parsePolicy turns the concurrency key into a Policy. A misspelling is a
+// load error naming every accepted spelling: the alternative is a rule that
+// silently gets the default and behaves in a way its author never asked for.
+func parsePolicy(s string) (Policy, error) {
+	switch Policy(s) {
+	case "":
+		return PolicyRestart, nil
+	case PolicyRestart, PolicyDrop, PolicyQueue:
+		return Policy(s), nil
+	default:
+		return "", fmt.Errorf("concurrency %q is not one of restart, drop, queue", s)
+	}
+}
+
 func parseDuration(s string) (time.Duration, error) {
 	if s == "" {
 		return 0, nil
@@ -173,6 +206,18 @@ func (r *Rule) Matches(e eventbus.Event) (bool, error) {
 		return false, nil
 	}
 	return r.EvalWhen(r.program, e)
+}
+
+// CancelledBy reports whether an event on topic drops this rule's runs. The
+// patterns are the same shape as on, so cancel-on takes an exact topic or a
+// prefix glob.
+func (r *Rule) CancelledBy(topic string) bool {
+	for _, pattern := range r.CancelOn {
+		if MatchTopic(pattern, topic) {
+			return true
+		}
+	}
+	return false
 }
 
 // EvalWhen runs a condition compiled from this rule against e. A nil program

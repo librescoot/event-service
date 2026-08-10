@@ -42,6 +42,34 @@ func (r *recorder) step(name string) action.Action {
 	}}
 }
 
+// newGate returns a gate for a gated step and the function that opens it.
+// Opening twice is safe, so a test can defer the open and still call it where
+// it means to. Deferring matters: a test that fails an assertion before its
+// own open would otherwise leave a worker parked on the gate forever, and
+// Pool.Stop, which the pool's own cleanup calls afterwards, waits for that
+// worker. A clean failure would turn into a hung package.
+func newGate() (chan struct{}, func()) {
+	gate := make(chan struct{})
+	var once sync.Once
+	return gate, func() { once.Do(func() { close(gate) }) }
+}
+
+// gated is a step that records itself and then waits for the test to open
+// gate, so a run can be held mid-flight without a timer deciding when.
+func (r *recorder) gated(name string, gate <-chan struct{}) action.Action {
+	return fnAction{fn: func() error {
+		r.add(name)
+		<-gate
+		return nil
+	}}
+}
+
+func (r *recorder) add(name string) {
+	r.mu.Lock()
+	r.seen = append(r.seen, name)
+	r.mu.Unlock()
+}
+
 func (r *recorder) failing(name string, err error) action.Action {
 	return fnAction{fn: func() error {
 		r.mu.Lock()
@@ -430,6 +458,334 @@ func TestRunnerStopCancelsAPendingTail(t *testing.T) {
 	}
 	if got := rec.list(); !equal(got, []string{"one"}) {
 		t.Errorf("steps ran as %v after Stop, want only one", got)
+	}
+}
+
+// TestRestartCancelsThePendingTailAndStartsOver parks the first run on an
+// hour-long tail, so the only way the scheduler can be down to one pending
+// fire after the second trigger is that the first run's tail was dropped.
+// Counting pending fires is the check that separates restart from a runner
+// that simply lets both runs live.
+func TestRestartCancelsThePendingTailAndStartsOver(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"}, Concurrency: "restart",
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "1h"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "the first run to park on its tail", func() bool { return sch.Pending() == 1 })
+
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	waitFor(t, "the restarted run to park on its tail", func() bool {
+		return len(rec.list()) == 2 && sch.Pending() >= 1
+	})
+
+	if got := sch.Pending(); got != 1 {
+		t.Errorf("scheduler has %d pending fire(s) after a restart, want 1; the old tail must be dropped", got)
+	}
+	if got := rn.Active(); got != 1 {
+		t.Errorf("Active() = %d after a restart, want 1; a restart replaces the run rather than adding one", got)
+	}
+	if got := rec.list(); !equal(got, []string{"one", "one"}) {
+		t.Errorf("steps ran as %v, want one, one; a restart starts the sequence over", got)
+	}
+}
+
+// TestRestartIsTheDefaultWhenConcurrencyIsOmitted repeats the restart check
+// with the key left out and a tail short enough to land, so the restarted run
+// is seen through to its end.
+func TestRestartIsTheDefaultWhenConcurrencyIsOmitted(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "60ms"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "the first run to park on its tail", func() bool { return sch.Pending() == 1 })
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "the restarted run to end", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"one", "one", "two"}) {
+		t.Errorf("steps ran as %v, want one, one, two; an omitted concurrency means restart", got)
+	}
+	// The dropped tail would land around here if it had not been cancelled.
+	time.Sleep(80 * time.Millisecond)
+	if got := rec.list(); !equal(got, []string{"one", "one", "two"}) {
+		t.Errorf("steps ran as %v once the first tail's delay had passed, want one, one, two", got)
+	}
+}
+
+// TestDropIgnoresAReFireWhileARunIsLive holds the first run inside a step
+// rather than on a timer, so "a run is live" is a fact rather than a race,
+// and then fires a third time after that run has ended: drop must mean
+// "ignored while busy", not "fires once and never again".
+func TestDropIgnoresAReFireWhileARunIsLive(t *testing.T) {
+	gate, open := newGate()
+	defer open()
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"}, Concurrency: "drop",
+		Steps: []rules.StepConfig{push("a", "1"), push("b", "2")},
+	}, nil)
+	s := seqWith(t, r, rec.gated("one", gate), rec.step("two"))
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	waitFor(t, "the first step to start", func() bool { return len(rec.list()) == 1 })
+
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	if got := rn.Active(); got != 1 {
+		t.Errorf("Active() = %d after a dropped re-fire, want 1", got)
+	}
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v, want only one; a re-fire must be ignored while a run is live", got)
+	}
+
+	open()
+	waitFor(t, "the first run to end", func() bool { return rn.Active() == 0 })
+
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	waitFor(t, "the third fire to run", func() bool { return len(rec.list()) == 4 })
+	if got := rec.list(); !equal(got, []string{"one", "two", "one", "two"}) {
+		t.Errorf("steps ran as %v, want one, two, one, two; drop must not latch the rule off", got)
+	}
+}
+
+// TestQueueRunsSequencesBackToBack gives the pool two workers, so a runner
+// that started the queued fires instead of holding them would have somewhere
+// to run them and the interleaving would show.
+func TestQueueRunsSequencesBackToBack(t *testing.T) {
+	gate, open := newGate()
+	defer open()
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"}, Concurrency: "queue",
+		Steps: []rules.StepConfig{push("a", "1"), push("b", "2")},
+	}, nil)
+	s := seqWith(t, r, rec.gated("start", gate), rec.step("end"))
+
+	rn := NewRunner(startedPool(t, 2, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	waitFor(t, "the first run to start", func() bool { return len(rec.list()) == 1 })
+
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	// A queued fire holds no worker and starts nothing: with the first run
+	// stuck in its opening step, the other two must still be waiting.
+	time.Sleep(30 * time.Millisecond)
+	if got := rec.list(); !equal(got, []string{"start"}) {
+		t.Fatalf("steps ran as %v while the first run was still in its first step, want only start", got)
+	}
+
+	open()
+	waitFor(t, "all three runs to end", func() bool { return len(rec.list()) == 6 })
+	want := []string{"start", "end", "start", "end", "start", "end"}
+	if got := rec.list(); !equal(got, want) {
+		t.Errorf("steps ran as %v, want %v; queued runs go back to back, not side by side", got, want)
+	}
+}
+
+// TestQueueIsBoundedAndCountsRefusals fires far past the bound while the
+// first run is held, so the backlog cannot drain underneath the test. A
+// flapping trigger must cost a fixed amount of memory, not a growing one.
+func TestQueueIsBoundedAndCountsRefusals(t *testing.T) {
+	gate, open := newGate()
+	defer open()
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"}, Concurrency: "queue",
+		Steps: []rules.StepConfig{push("a", "1")},
+	}, nil)
+	s := seqWith(t, r, rec.gated("run", gate))
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	waitFor(t, "the first run to start", func() bool { return len(rec.list()) == 1 })
+
+	for i := 0; i < 12; i++ {
+		rn.Fire(s, eventbus.Event{Topic: "x.y"})
+	}
+	if got := rn.Refused(); got != 4 {
+		t.Errorf("Refused() = %d after 12 fires behind a live run, want 4; the queue holds 8", got)
+	}
+
+	open()
+	waitFor(t, "the queue to drain", func() bool { return len(rec.list()) == 9 })
+	time.Sleep(30 * time.Millisecond)
+	if got := len(rec.list()); got != 9 {
+		t.Errorf("%d runs executed, want 9: the live one plus a queue of 8", got)
+	}
+	if got := rn.Refused(); got != 4 {
+		t.Errorf("Refused() = %d once the queue drained, want 4", got)
+	}
+}
+
+// TestCancelOnDropsThePendingTail checks the scheduler, not just the
+// recorder: a cancel that only marked the run ended and left the timer
+// running would still keep step two from firing, and would still leak a
+// timer per cancel.
+func TestCancelOnDropsThePendingTail(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"alarm.triggered"}, CancelOn: []string{"alarm.disarmed"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "1h"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+
+	waitFor(t, "the run to park on its tail", func() bool { return sch.Pending() == 1 })
+
+	if got := rn.CancelMatching("alarm.disarmed"); got != 1 {
+		t.Errorf("CancelMatching returned %d, want 1", got)
+	}
+	if got := sch.Pending(); got != 0 {
+		t.Errorf("scheduler has %d pending fire(s) right after the cancel, want 0", got)
+	}
+	if got := rn.Active(); got != 0 {
+		t.Errorf("Active() = %d after the cancel, want 0", got)
+	}
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v, want only one", got)
+	}
+}
+
+func TestCancelOnMatchesGlobs(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"alarm.triggered"}, CancelOn: []string{"alarm.*"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "1h"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+	waitFor(t, "the run to park on its tail", func() bool { return sch.Pending() == 1 })
+
+	if got := rn.CancelMatching("battery.inserted"); got != 0 {
+		t.Errorf("CancelMatching on an unrelated topic returned %d, want 0", got)
+	}
+	if got := rn.Active(); got != 1 {
+		t.Fatalf("Active() = %d after an unrelated topic, want 1", got)
+	}
+	if got := rn.CancelMatching("alarm.disarmed"); got != 1 {
+		t.Errorf("CancelMatching on a topic under the glob returned %d, want 1", got)
+	}
+	if got := rn.Active(); got != 0 {
+		t.Errorf("Active() = %d after the cancel, want 0", got)
+	}
+}
+
+// TestCancelOnAlsoDropsQueuedFires: a queued trigger that started the moment
+// its rule was cancelled would defeat the point of cancelling, since the
+// backlog is exactly the runs the same trigger built up.
+//
+// The second half is the part with teeth. A backlog that survives a cancel
+// does not run straight away, because the cancelled run never reaches the
+// promotion path; it lies there until the next trigger's run ends and then
+// comes out behind it. So the test fires once more at the end and insists
+// that trigger is the only thing left to run.
+func TestCancelOnAlsoDropsQueuedFires(t *testing.T) {
+	gate, open := newGate()
+	defer open()
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"alarm.triggered"}, Concurrency: "queue",
+		CancelOn: []string{"alarm.disarmed"},
+		Steps:    []rules.StepConfig{push("a", "1")},
+	}, nil)
+	s := seqWith(t, r, rec.gated("run", gate))
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+	waitFor(t, "the first run to start", func() bool { return len(rec.list()) == 1 })
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+
+	if got := rn.CancelMatching("alarm.disarmed"); got != 1 {
+		t.Errorf("CancelMatching returned %d, want 1; queued triggers are not runs", got)
+	}
+	open()
+
+	waitFor(t, "the cancelled run to leave the registry", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"run"}) {
+		t.Fatalf("steps ran as %v, want only run; the backlog must not start on a cancel", got)
+	}
+
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+	waitFor(t, "the trigger after the cancel to run", func() bool { return len(rec.list()) >= 2 })
+	// Long enough for two more promoted runs to appear, since neither has
+	// anything left to wait for by now.
+	time.Sleep(50 * time.Millisecond)
+	if got := rec.list(); !equal(got, []string{"run", "run"}) {
+		t.Errorf("steps ran as %v, want run, run; a cancel throws the backlog away rather than deferring it", got)
+	}
+}
+
+// TestCancelLandingMidStepDoesNotLetOneMoreStepFire pins the re-check advance
+// makes under the lock immediately before Submit. The window it closes is the
+// gap between a run being found live and its next step being queued, and a
+// step's own when is what can hold a run inside that gap: the condition is
+// evaluated outside the lock, on purpose, because it may read the shadow
+// store. Here state() blocks until the cancel has landed, so the run is
+// already ended by the time the when comes back true.
+//
+// Mutating the re-check in runStep into a no-op must fail this test.
+func TestCancelLandingMidStepDoesNotLetOneMoreStepFire(t *testing.T) {
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+
+	lookup := func(hash, field string) string {
+		once.Do(func() {
+			close(reached)
+			<-release
+		})
+		return "armed"
+	}
+
+	rec := &recorder{}
+	twoRan := make(chan struct{})
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"alarm.triggered"}, CancelOn: []string{"alarm.disarmed"},
+		Steps: []rules.StepConfig{
+			push("a", "1"),
+			{Do: "redis", List: "b", Push: "2", When: `state("alarm", "status") == "armed"`},
+		},
+	}, lookup)
+	two := fnAction{fn: func() error { close(twoRan); return nil }}
+	s := seqWith(t, r, rec.step("one"), two)
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
+
+	<-reached
+	if got := rn.CancelMatching("alarm.disarmed"); got != 1 {
+		t.Fatalf("CancelMatching returned %d while the run sat in its step when, want 1", got)
+	}
+	close(release)
+
+	select {
+	case <-twoRan:
+		t.Fatal("step two was submitted after the run was cancelled; the re-check before Submit is not holding")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v, want only one", got)
 	}
 }
 

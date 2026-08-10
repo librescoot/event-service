@@ -285,27 +285,77 @@ func TestCompileParsesDurations(t *testing.T) {
 	}
 }
 
-func TestCompileRejectsConcurrency(t *testing.T) {
-	_, errs := Compile([]RuleConfig{{
-		Name: "r", On: []string{"x.y"}, Concurrency: "restart", Steps: []StepConfig{redisStep()},
-	}}, noState)
-	if len(errs) != 1 {
-		t.Fatalf("got %d errors, want 1", len(errs))
-	}
-	if !strings.Contains(errs[0].Error(), "not supported yet") {
-		t.Errorf("error should name the limitation, got %v", errs[0])
+func TestCompileDefaultsToTheRestartPolicy(t *testing.T) {
+	r := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"}, Steps: []StepConfig{redisStep()},
+	}, noState)
+	if r.Concurrency != PolicyRestart {
+		t.Errorf("concurrency = %q with the key omitted, want %q", r.Concurrency, PolicyRestart)
 	}
 }
 
-func TestCompileRejectsCancelOn(t *testing.T) {
+func TestCompileParsesEveryPolicy(t *testing.T) {
+	for _, want := range []Policy{PolicyRestart, PolicyDrop, PolicyQueue} {
+		r := mustCompileOne(t, RuleConfig{
+			Name: "r", On: []string{"x.y"}, Concurrency: string(want), Steps: []StepConfig{redisStep()},
+		}, noState)
+		if r.Concurrency != want {
+			t.Errorf("concurrency = %q, want %q", r.Concurrency, want)
+		}
+	}
+}
+
+// TestUnknownPolicyIsRejectedNamingTheValidValues covers the typo case, which
+// is the one a user actually hits. A message that says only "invalid" leaves
+// them guessing at the spelling, so the three accepted words have to be in it,
+// along with the rule and the file to find them in.
+func TestUnknownPolicyIsRejectedNamingTheValidValues(t *testing.T) {
 	_, errs := Compile([]RuleConfig{{
-		Name: "r", On: []string{"x.y"}, CancelOn: []string{"alarm.disarmed"}, Steps: []StepConfig{redisStep()},
+		Name: "r", Source: "horn.toml", On: []string{"x.y"},
+		Concurrency: "restrat", Steps: []StepConfig{redisStep()},
 	}}, noState)
 	if len(errs) != 1 {
-		t.Fatalf("got %d errors, want 1", len(errs))
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
 	}
-	if !strings.Contains(errs[0].Error(), "not supported yet") {
-		t.Errorf("error should name the limitation, got %v", errs[0])
+	msg := errs[0].Error()
+	for _, want := range []string{`"r"`, "horn.toml", "restart", "drop", "queue"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should mention %s, got %q", want, msg)
+		}
+	}
+}
+
+func TestCompileKeepsCancelOnTopics(t *testing.T) {
+	r := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"}, CancelOn: []string{"alarm.disarmed", "vehicle.*"},
+		Steps: []StepConfig{redisStep()},
+	}, noState)
+	if len(r.CancelOn) != 2 || r.CancelOn[0] != "alarm.disarmed" || r.CancelOn[1] != "vehicle.*" {
+		t.Errorf("cancel-on = %v, want alarm.disarmed and vehicle.*", r.CancelOn)
+	}
+}
+
+func TestCancelledByMatchesExactTopicsAndGlobs(t *testing.T) {
+	r := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"}, CancelOn: []string{"alarm.disarmed", "vehicle.*"},
+		Steps: []StepConfig{redisStep()},
+	}, noState)
+	for topic, want := range map[string]bool{
+		"alarm.disarmed":  true,
+		"vehicle.locked":  true,
+		"alarm.triggered": false,
+		"vehicle":         false,
+	} {
+		if got := r.CancelledBy(topic); got != want {
+			t.Errorf("CancelledBy(%q) = %v, want %v", topic, got, want)
+		}
+	}
+
+	plain := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"}, Steps: []StepConfig{redisStep()},
+	}, noState)
+	if plain.CancelledBy("alarm.disarmed") {
+		t.Error("a rule with no cancel-on must not be cancelled by anything")
 	}
 }
 
@@ -334,23 +384,11 @@ func TestCompileRejectsDebounce(t *testing.T) {
 	}
 }
 
-// The three tests below guard finding 8: an empty spelling of an unsupported
-// feature (an empty list, an empty table, a zero duration) must be rejected
-// exactly like its non-empty form. All three parse to the same Go zero value
-// as an omitted key, so a check that looks at truthiness instead of presence
-// would let them through unnoticed.
-
-func TestCompileRejectsEmptyCancelOn(t *testing.T) {
-	_, errs := Compile([]RuleConfig{{
-		Name: "r", On: []string{"x.y"}, CancelOn: []string{}, Steps: []StepConfig{redisStep()},
-	}}, noState)
-	if len(errs) != 1 {
-		t.Fatalf("got %d errors, want 1", len(errs))
-	}
-	if !strings.Contains(errs[0].Error(), "not supported yet") {
-		t.Errorf("error should name the limitation, got %v", errs[0])
-	}
-}
+// The two tests below guard finding 8: an empty spelling of an unsupported
+// feature (an empty table, a zero duration) must be rejected exactly like its
+// non-empty form. Both parse to the same Go zero value as an omitted key, so
+// a check that looks at truthiness instead of presence would let them through
+// unnoticed.
 
 func TestCompileRejectsEmptyRepeat(t *testing.T) {
 	_, errs := Compile([]RuleConfig{{

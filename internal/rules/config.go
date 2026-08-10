@@ -30,8 +30,8 @@ type RuleConfig struct {
 	CancelOn    []string       `toml:"cancel-on"`
 	Repeat      map[string]any `toml:"repeat"`
 
-	// Debounce is a pointer, unlike the other rejected-by-name fields, so
-	// Compile can tell "debounce was never written" from "debounce was
+	// Debounce is a pointer because a duration has no nil of its own, and
+	// Compile has to tell "debounce was never written" from "debounce was
 	// written as an empty duration like 0s": both parse to the same zero
 	// time.Duration, but only the former is silence rather than a rule
 	// author believing the feature works.

@@ -59,17 +59,29 @@ func (en *Engine) RuleCount() int { return len(en.bounds) }
 // Patterns returns the PSUBSCRIBE patterns needed to see every topic any rule
 // mentions. Subscribing to exactly what is needed keeps an idle rule set from
 // waking the process on traffic nothing will match.
+//
+// A topic named only in cancel-on still needs a subscription. Leave it out and
+// the cancelling event never reaches Handle, so the rule keeps its pending
+// tail and the feature does nothing at all on a live scooter, while every test
+// that calls Handle directly still passes.
 func (en *Engine) Patterns() []string {
 	seen := make(map[string]bool)
 	var out []string
+	add := func(topic string) {
+		p := eventbus.ChannelPrefix + topic
+		if seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+
 	for _, b := range en.bounds {
 		for _, topic := range b.rule.On {
-			p := eventbus.ChannelPrefix + topic
-			if seen[p] {
-				continue
-			}
-			seen[p] = true
-			out = append(out, p)
+			add(topic)
+		}
+		for _, topic := range b.rule.CancelOn {
+			add(topic)
 		}
 	}
 	return out
@@ -78,7 +90,15 @@ func (en *Engine) Patterns() []string {
 // Handle matches e against every rule and dispatches those that fire. It runs
 // on the subscriber goroutine, so it must not block: matching is cheap and
 // Submit never waits.
+//
+// Cancelling comes first, and one event does both jobs: the disarm that stops
+// a rule blinking the hazards is usually also what a second rule chirps the
+// horn on. Doing it in this order also means a rule that lists a topic in both
+// on and cancel-on is stopped before it is started again, rather than the
+// other way round.
 func (en *Engine) Handle(e eventbus.Event) {
+	en.runner.CancelMatching(e.Topic)
+
 	now := time.Now()
 	for _, b := range en.bounds {
 		ok, err := b.rule.Matches(e)
