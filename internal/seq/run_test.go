@@ -28,6 +28,18 @@ type fnAction struct {
 func (a fnAction) Do(context.Context, eventbus.Event) error { return a.fn() }
 func (fnAction) Kind() string                               { return "test" }
 
+// ctxAction holds its worker until the pool cancels the context every action
+// runs under, which is what Pool.Stop does before it waits. A test that pins a
+// worker with this one has it let go at exactly the point Stop reaches it,
+// with no sleep to tune and no gate to open at the right moment.
+type ctxAction struct{}
+
+func (ctxAction) Do(ctx context.Context, _ eventbus.Event) error {
+	<-ctx.Done()
+	return nil
+}
+func (ctxAction) Kind() string { return "test" }
+
 type recorder struct {
 	mu   sync.Mutex
 	seen []string
@@ -754,9 +766,17 @@ func TestCancelOnAlsoDropsQueuedFires(t *testing.T) {
 }
 
 // TestStopDropsQueuedFires: shutdown is the one moment where running the
-// backlog would be worst, since the pool is about to go away underneath it.
-// A stopped runner starts nothing, whatever is still queued behind the run it
-// abandoned.
+// backlog would be worst, since the pool is about to go away underneath it. A
+// stopped runner throws away whatever is queued behind the run it abandons,
+// and starts nothing out of a backlog afterwards whatever put it there.
+//
+// Both halves are checked against the runner's own state, and the second one
+// puts a trigger back by hand. That is deliberate. Stop also ends every live
+// run, so no run is left that could reach the promotion path and show either
+// guarantee from the outside: a test written purely through Fire and the
+// recorder passes just as happily against a Stop that keeps the backlog and a
+// promotion that will still hand one out, which is what the first version of
+// this test did.
 func TestStopDropsQueuedFires(t *testing.T) {
 	gate, open := newGate()
 	defer open()
@@ -773,9 +793,35 @@ func TestStopDropsQueuedFires(t *testing.T) {
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
+	rn.mu.Lock()
+	queuedBefore := len(rn.queued["r"])
+	rn.mu.Unlock()
+	if queuedBefore != 2 {
+		t.Fatalf("%d trigger(s) queued behind the live run before Stop, want 2", queuedBefore)
+	}
+
 	rn.Stop()
 	if got := rn.Active(); got != 0 {
 		t.Errorf("Active() = %d after Stop, want 0", got)
+	}
+
+	rn.mu.Lock()
+	queuedAfter := len(rn.queued["r"])
+	rn.mu.Unlock()
+	if queuedAfter != 0 {
+		t.Errorf("Stop left %d trigger(s) in the backlog, want 0", queuedAfter)
+	}
+
+	// Nothing can add to a backlog after Stop, so the guard is exercised with
+	// a trigger put there by hand: it has to hold for whatever is in the map,
+	// however it got there, because what it is protecting against is a step
+	// being submitted into a pool that is on its way out.
+	rn.mu.Lock()
+	rn.queued["r"] = []queuedFire{{seq: s, event: eventbus.Event{Topic: "x.y"}}}
+	promoted := rn.startQueuedLocked("r")
+	rn.mu.Unlock()
+	if promoted != nil {
+		t.Errorf("a stopped runner promoted %s out of the backlog, want nothing", promoted.id)
 	}
 
 	open()
