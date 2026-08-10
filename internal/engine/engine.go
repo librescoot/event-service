@@ -9,6 +9,7 @@ import (
 
 	"github.com/librescoot/event-service/internal/action"
 	"github.com/librescoot/event-service/internal/rules"
+	"github.com/librescoot/event-service/internal/seq"
 	"github.com/librescoot/eventbus"
 )
 
@@ -18,40 +19,34 @@ type Logger interface {
 }
 
 type bound struct {
-	rule   *rules.Rule
-	action action.Action
+	rule *rules.Rule
+	seq  *seq.Sequence
 
 	mu       sync.Mutex
 	lastFire time.Time
 }
 
-// Engine holds the compiled rules and their built actions.
+// Engine holds the compiled rules and their built sequences.
 type Engine struct {
 	bounds []*bound
-	pool   *action.Pool
+	runner *seq.Runner
 	log    Logger
 }
 
-// New builds an action for every rule. A rule whose action cannot be built is
+// New builds a sequence for every rule. A rule whose steps cannot be built is
 // reported and dropped; the others still run, for the same reason a bad file
 // does not stop the good ones loading.
 func New(rs []*rules.Rule, pool *action.Pool, c action.Pusher, log Logger) (*Engine, []error) {
-	en := &Engine{pool: pool, log: log}
+	en := &Engine{runner: seq.NewRunner(pool, log), log: log}
 	var errs []error
 
 	for _, r := range rs {
-		a, err := action.Build(action.Spec{
-			Do:      r.Step.Do,
-			List:    r.Step.List,
-			Push:    r.Step.Push,
-			Command: r.Step.Command,
-			Timeout: r.Step.Timeout,
-		}, c)
+		s, err := seq.Build(r, c)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("rule %q in %s: %w", r.Name, r.Source, err))
 			continue
 		}
-		en.bounds = append(en.bounds, &bound{rule: r, action: a})
+		en.bounds = append(en.bounds, &bound{rule: r, seq: s})
 	}
 	return en, errs
 }
@@ -95,9 +90,14 @@ func (en *Engine) Handle(e eventbus.Event) {
 		if !b.allow(now) {
 			continue
 		}
-		en.pool.Submit(b.action, e, b.rule.Name, nil)
+		en.runner.Fire(b.seq, e)
 	}
 }
+
+// Stop abandons every in-flight sequence and refuses new ones. Call it before
+// stopping the pool, so a run cannot queue a step into a pool that is already
+// shutting down.
+func (en *Engine) Stop() { en.runner.Stop() }
 
 // allow enforces the cooldown. A flapping source must not be able to fill the
 // action queue, so this is checked before Submit rather than inside the action.

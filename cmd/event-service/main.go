@@ -84,6 +84,9 @@ func main() {
 	for _, err := range buildErrs {
 		log.Printf("rules: %v", err)
 	}
+	// Registered after pool.Stop so it runs before it: a sequence must stop
+	// handing steps to the pool before the pool goes away.
+	defer en.Stop()
 
 	log.Printf("%d rules live from %s", en.RuleCount(), *rulesDir)
 

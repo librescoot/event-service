@@ -60,10 +60,20 @@ Supported `do` kinds for `[[rule.step]]`:
 - `redis`: push a value onto a list with `list` and `push`.
 - `exec`: run a command with `command` and an optional `timeout`.
 
-Not supported yet: multiple steps per rule, `after`, `concurrency`,
-`cancel-on`, `repeat`, `debounce`, and the `can`, `lua`, and `http` step
-kinds. A rule using any of these fails to load with an error naming the rule
-and file, rather than silently doing nothing. This includes writing the empty
+A rule can have several `[[rule.step]]` blocks. They run in order, and a step
+starts only once the one before it has finished. A step that fails ends the
+run and the steps after it do not run: a sequence is a recipe, so carrying on
+would act on a state the failed step never established.
+
+A step can carry its own `when`, checked immediately before that step runs
+and evaluated against the event that triggered the rule, with `state()`
+reading whatever is current at that moment. A false step `when` ends the run
+cleanly; it does not skip ahead to the next step.
+
+Not supported yet: `after`, `concurrency`, `cancel-on`, `repeat`, `debounce`,
+and the `can`, `lua`, and `http` step kinds. A rule using any of these fails
+to load with an error naming the rule, the file, and the step it is on,
+rather than silently doing nothing. This includes writing the empty
 form of a feature (`cancel-on = []`, `repeat = {}`, `debounce = "0s"`): the
 key being present is what is rejected, not whether its value would have done
 anything.

@@ -22,10 +22,19 @@ type Rule struct {
 	Source   string
 	On       []string
 	Cooldown time.Duration
-	Step     StepConfig
+	Steps    []Step
 
 	program *vm.Program
 	state   StateFunc
+}
+
+// Step is one step of a rule. Config holds the fields the action is built
+// from; When, when not nil, is a condition checked immediately before the
+// step runs, as opposed to the rule-level condition checked when the event
+// arrived.
+type Step struct {
+	Config StepConfig
+	When   *vm.Program
 }
 
 // Compile turns parsed config into runnable rules. Errors are per-rule, so one
@@ -59,9 +68,6 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 	if len(c.Steps) == 0 {
 		return nil, fmt.Errorf("missing step")
 	}
-	if len(c.Steps) > 1 {
-		return nil, fmt.Errorf("multi-step rules are not supported yet")
-	}
 	if c.Concurrency != "" {
 		return nil, fmt.Errorf("concurrency is not supported yet")
 	}
@@ -79,19 +85,11 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 		return nil, fmt.Errorf("debounce is not supported yet")
 	}
 
-	step := c.Steps[0]
-	if step.After != "" {
-		return nil, fmt.Errorf("step after is not supported yet")
-	}
-	if step.When != "" {
-		return nil, fmt.Errorf("step when is not supported yet")
-	}
-
 	r := &Rule{
 		Name:   c.Name,
 		Source: c.Source,
 		On:     c.On,
-		Step:   step,
+		Steps:  make([]Step, 0, len(c.Steps)),
 		state:  lookup,
 	}
 
@@ -101,14 +99,38 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 	}
 
 	if c.When != "" {
-		p, err := expr.Compile(c.When, expr.Env(exprEnv{}), expr.AsBool())
+		p, err := compileWhen(c.When)
 		if err != nil {
 			return nil, fmt.Errorf("when: %w", err)
 		}
 		r.program = p
 	}
 
+	// The index goes into every step error: with a rule of five steps, an
+	// error that names only the rule leaves the user reading all five.
+	for i, sc := range c.Steps {
+		if sc.After != "" {
+			return nil, fmt.Errorf("step %d: after is not supported yet", i)
+		}
+		s := Step{Config: sc}
+		if sc.When != "" {
+			p, err := compileWhen(sc.When)
+			if err != nil {
+				return nil, fmt.Errorf("step %d: when: %w", i, err)
+			}
+			s.When = p
+		}
+		r.Steps = append(r.Steps, s)
+	}
+
 	return r, nil
+}
+
+// compileWhen turns one condition into a program. Rule-level and step-level
+// conditions both come through here, so both see the same variables and both
+// turn a typo into a load error rather than a rule that never fires.
+func compileWhen(src string) (*vm.Program, error) {
+	return expr.Compile(src, expr.Env(exprEnv{}), expr.AsBool())
 }
 
 func parseDuration(s string) (time.Duration, error) {
@@ -143,7 +165,18 @@ func (r *Rule) Matches(e eventbus.Event) (bool, error) {
 	if !matched {
 		return false, nil
 	}
-	if r.program == nil {
+	return r.EvalWhen(r.program, e)
+}
+
+// EvalWhen runs a condition compiled from this rule against e. A nil program
+// is the absent condition and evaluates true.
+//
+// A step condition is passed the event that triggered the run, so a step
+// three deep in a sequence reads the same to, from and data the rule matched
+// on, and state() reads whatever the shadow store holds at the moment the
+// step is reached.
+func (r *Rule) EvalWhen(p *vm.Program, e eventbus.Event) (bool, error) {
+	if p == nil {
 		return true, nil
 	}
 
@@ -164,7 +197,7 @@ func (r *Rule) Matches(e eventbus.Event) (bool, error) {
 		env.Data = map[string]any{}
 	}
 
-	out, err := expr.Run(r.program, env)
+	out, err := expr.Run(p, env)
 	if err != nil {
 		return false, fmt.Errorf("evaluate when: %w", err)
 	}

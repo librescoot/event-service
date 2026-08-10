@@ -147,9 +147,7 @@ func TestCompileRejectsMissingSteps(t *testing.T) {
 
 func TestCompileRejectsUnsupportedFeaturesByName(t *testing.T) {
 	cases := map[string]RuleConfig{
-		"two steps": {Name: "a", On: []string{"x.y"}, Steps: []StepConfig{redisStep(), redisStep()}},
-		"after":     {Name: "b", On: []string{"x.y"}, Steps: []StepConfig{{Do: "redis", List: "l", Push: "p", After: "30s"}}},
-		"step when": {Name: "c", On: []string{"x.y"}, Steps: []StepConfig{{Do: "redis", List: "l", Push: "p", When: "true"}}},
+		"after": {Name: "b", On: []string{"x.y"}, Steps: []StepConfig{{Do: "redis", List: "l", Push: "p", After: "30s"}}},
 	}
 	for label, c := range cases {
 		_, errs := Compile([]RuleConfig{c}, noState)
@@ -159,6 +157,71 @@ func TestCompileRejectsUnsupportedFeaturesByName(t *testing.T) {
 		}
 		if !strings.Contains(errs[0].Error(), "not supported yet") {
 			t.Errorf("%s: error should name the limitation, got %v", label, errs[0])
+		}
+	}
+}
+
+func TestCompileKeepsEveryStepInOrder(t *testing.T) {
+	r := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Steps: []StepConfig{
+			{Do: "redis", List: "l", Push: "first"},
+			{Do: "redis", List: "l", Push: "second"},
+			{Do: "exec", Command: "true"},
+		},
+	}, noState)
+
+	if len(r.Steps) != 3 {
+		t.Fatalf("got %d steps, want 3", len(r.Steps))
+	}
+	if r.Steps[0].Config.Push != "first" || r.Steps[1].Config.Push != "second" {
+		t.Errorf("steps came out in the wrong order: %v", r.Steps)
+	}
+	if r.Steps[2].Config.Command != "true" {
+		t.Errorf("step 2 lost its command: %v", r.Steps[2].Config)
+	}
+}
+
+func TestCompileCompilesStepWhen(t *testing.T) {
+	r := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Steps: []StepConfig{
+			{Do: "redis", List: "l", Push: "p"},
+			{Do: "redis", List: "l", Push: "p", When: `state("alarm", "status") == "armed"`},
+		},
+	}, noState)
+
+	if r.Steps[0].When != nil {
+		t.Error("a step without when should have a nil program")
+	}
+	if r.Steps[1].When == nil {
+		t.Fatal("a step with when should have a compiled program")
+	}
+
+	ok, err := r.EvalWhen(r.Steps[1].When, eventbus.Event{Topic: "x.y"})
+	if err != nil {
+		t.Fatalf("EvalWhen: %v", err)
+	}
+	if ok {
+		t.Error("noState returns empty, so the condition should be false")
+	}
+}
+
+func TestCompileRejectsBadStepWhenNamingRuleFileAndIndex(t *testing.T) {
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", Source: "horn.toml", On: []string{"x.y"},
+		Steps: []StepConfig{
+			{Do: "redis", List: "l", Push: "p"},
+			{Do: "redis", List: "l", Push: "p", When: "this is not ( valid"},
+		},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1", len(errs))
+	}
+	msg := errs[0].Error()
+	for _, want := range []string{`"r"`, "horn.toml", "step 1"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should mention %s, got %q", want, msg)
 		}
 	}
 }

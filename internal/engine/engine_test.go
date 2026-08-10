@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -135,6 +136,60 @@ func TestCooldownExpiresAndFiresAgain(t *testing.T) {
 
 	if got := p.count(); got != 2 {
 		t.Errorf("fired %d times across an expired cooldown, want 2", got)
+	}
+}
+
+// recordingPusher keeps what was pushed, so a multi-step rule can be checked
+// for order and not just for count.
+type recordingPusher struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (p *recordingPusher) LPush(key string, values ...any) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, v := range values {
+		p.seen = append(p.seen, fmt.Sprintf("%s=%v", key, v))
+	}
+	return 1, nil
+}
+
+func (p *recordingPusher) list() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.seen...)
+}
+
+func TestHandleRunsEveryStepOfAMultiStepRule(t *testing.T) {
+	p := &recordingPusher{}
+	pool := action.NewPool(1, 8, nopLog{})
+	pool.Start()
+	defer pool.Stop()
+
+	rs := compileRules(t, rules.RuleConfig{
+		Name: "r", On: []string{"alarm.triggered"},
+		Steps: []rules.StepConfig{
+			{Do: "redis", List: "scooter:horn", Push: "on"},
+			{Do: "redis", List: "scooter:blinker", Push: "both"},
+			{Do: "redis", List: "scooter:horn", Push: "off"},
+		},
+	})
+	en, errs := New(rs, pool, p, nopLog{})
+	if len(errs) != 0 {
+		t.Fatalf("New: %v", errs)
+	}
+	defer en.Stop()
+
+	en.Handle(eventbus.Event{Topic: "alarm.triggered"})
+	waitFor(t, func() bool { return len(p.list()) == 3 })
+
+	want := []string{"scooter:horn=on", "scooter:blinker=both", "scooter:horn=off"}
+	got := p.list()
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("steps ran as %v, want %v", got, want)
+		}
 	}
 }
 
