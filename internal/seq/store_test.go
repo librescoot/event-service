@@ -1350,57 +1350,119 @@ func TestReplayAppliesTheRestartPolicyAcrossTwoRecords(t *testing.T) {
 	}
 }
 
-// TestReplayAppliesTheDropPolicyAcrossTwoRecords is the same gate under the
-// other policy: a drop-policy rule ignores what overlaps a live run, so the
-// second record is thrown away rather than resumed alongside. Throwing it away
-// means removing it, or it comes back at every boot to be thrown away again.
-func TestReplayAppliesTheDropPolicyAcrossTwoRecords(t *testing.T) {
+// TestReplayKeepsOneRecordUnderDropAndQueue is the same gate under the other
+// two policies, both of which keep the earliest record and throw the rest
+// away. Throwing one away means removing it, or it comes back at every boot to
+// be thrown away again.
+//
+// Queue has nothing to queue behind here. A backlog is memory only and never
+// crosses a restart, so the only thing that puts two records on one rule is a
+// removal that failed at the last shutdown, and both then name the same step.
+// Resuming them side by side would run one tail twice and hand a queue rule
+// the overlap it exists to forbid.
+func TestReplayKeepsOneRecordUnderDropAndQueue(t *testing.T) {
+	for _, policy := range []string{"drop", "queue"} {
+		t.Run(policy, func(t *testing.T) {
+			log := &capturingLog{}
+			st, _ := memStore(t, log)
+			rec := &recorder{}
+			r := compileRule(t, rules.RuleConfig{
+				Name: "hazards", On: []string{"alarm.triggered"}, Concurrency: policy,
+				Steps: []rules.StepConfig{
+					push("a", "1"),
+					{Do: "redis", List: "b", Push: "2", After: "1h"},
+					push("c", "3"),
+				},
+			}, nil)
+			s := seqWith(t, r, rec.step("one"), rec.step("two"), rec.step("three"))
+
+			now := time.Now()
+			for id, at := range map[string]time.Time{
+				"first":  now.Add(60 * time.Millisecond),
+				"second": now.Add(120 * time.Millisecond),
+			} {
+				if err := st.Put(Pending{
+					ID: id, Rule: "hazards", Step: 1,
+					FireAt:      at.UnixMilli(),
+					Fingerprint: fingerprintOf(s, 1),
+					Event:       eventbus.Event{Topic: "alarm.triggered"},
+				}); err != nil {
+					t.Fatalf("Put %s: %v", id, err)
+				}
+			}
+
+			sch := testSched(t)
+			rn := NewRunner(startedPool(t, 1, 8), sch, st, log)
+			if n := rn.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
+				t.Errorf("Replay reported %d resumed step(s), want 1; %s keeps the first and ignores the rest", n, policy)
+			}
+			if got := rn.Active(); got != 1 {
+				t.Errorf("Active() = %d after replaying two records, want 1", got)
+			}
+			if got := sch.Pending(); got != 1 {
+				t.Errorf("scheduler has %d pending fire(s), want 1", got)
+			}
+			got := loadAll(t, st)
+			if len(got) != 1 || got[0].ID != "first" {
+				t.Fatalf("records after the replay are %+v, want only first", got)
+			}
+			if !log.contains("second") {
+				t.Errorf("the dropped record must be logged, got:\n%s", log.all())
+			}
+
+			waitFor(t, "the surviving run to end", func() bool { return rn.Active() == 0 })
+			if got := rec.list(); !equal(got, []string{"two", "three"}) {
+				t.Errorf("steps ran as %v, want two, three once", got)
+			}
+		})
+	}
+}
+
+// TestAStepDrainedFromThePoolDuringShutdownRemovesItsRecord covers the gap
+// between the runner stopping and the pool stopping. Shutdown ends the runs
+// and leaves their records for the next start, but the workers are still
+// draining the queue while that happens, so a step handed over before the
+// signal can still run. Whichever way that lands, the record and the action
+// must agree: if the action runs, the record has to go, or the next start
+// fires the same hardware a second time with nothing having asked it to.
+func TestAStepDrainedFromThePoolDuringShutdownRemovesItsRecord(t *testing.T) {
 	log := &capturingLog{}
 	st, _ := memStore(t, log)
 	rec := &recorder{}
-	r := compileRule(t, rules.RuleConfig{
-		Name: "hazards", On: []string{"alarm.triggered"}, Concurrency: "drop",
-		Steps: []rules.StepConfig{
-			push("a", "1"),
-			{Do: "redis", List: "b", Push: "2", After: "1h"},
-			push("c", "3"),
-		},
-	}, nil)
-	s := seqWith(t, r, rec.step("one"), rec.step("two"), rec.step("three"))
+	s := replaySeq(t, rec)
 
-	now := time.Now()
-	for id, at := range map[string]time.Time{
-		"first":  now.Add(60 * time.Millisecond),
-		"second": now.Add(120 * time.Millisecond),
-	} {
-		if err := st.Put(Pending{
-			ID: id, Rule: "hazards", Step: 1,
-			FireAt:      at.UnixMilli(),
-			Fingerprint: fingerprintOf(s, 1),
-			Event:       eventbus.Event{Topic: "alarm.triggered"},
-		}); err != nil {
-			t.Fatalf("Put %s: %v", id, err)
-		}
+	if err := st.Put(Pending{
+		ID: "off", Rule: "hazards", Step: 1,
+		FireAt:      time.Now().Add(-time.Second).UnixMilli(),
+		Fingerprint: fingerprintOf(s, 1),
+		Event:       eventbus.Event{Topic: "alarm.triggered"},
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
 	}
 
-	sch := testSched(t)
-	rn := NewRunner(startedPool(t, 1, 8), sch, st, log)
+	gate, open := newGate()
+	defer open()
+	pool := startedPool(t, 1, 4)
+	if !pool.Submit(gatedAction{gate: gate}, eventbus.Event{}, "pin", nil) {
+		t.Fatal("the pinning job was refused by an empty pool")
+	}
+	waitFor(t, "the pinning job to reach the worker", func() bool { return pool.Stats().Dispatched == 1 })
+
+	rn := NewRunner(pool, testSched(t), st, log)
 	if n := rn.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
-		t.Errorf("Replay reported %d resumed step(s), want 1; a drop rule takes the first and ignores the rest", n)
+		t.Fatalf("Replay resumed %d step(s), want 1", n)
 	}
-	if got := sch.Pending(); got != 1 {
-		t.Errorf("scheduler has %d pending fire(s), want 1", got)
-	}
-	got := loadAll(t, st)
-	if len(got) != 1 || got[0].ID != "first" {
-		t.Fatalf("records after the replay are %+v, want only first", got)
-	}
-	if !log.contains("second") {
-		t.Errorf("the dropped record must be logged, got:\n%s", log.all())
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("steps ran as %v while the only worker was pinned, want none", got)
 	}
 
-	waitFor(t, "the surviving run to end", func() bool { return rn.Active() == 0 })
-	if got := rec.list(); !equal(got, []string{"two", "three"}) {
-		t.Errorf("steps ran as %v, want two, three once", got)
+	// The runner stops, and the pool has not been told yet: this is the window
+	// main leaves open between en.Stop() and pool.Stop().
+	rn.Stop()
+	open()
+
+	waitFor(t, "the queued step to be drained by the worker", func() bool { return len(rec.list()) == 1 })
+	if n := countPending(t, st); n != 0 {
+		t.Fatalf("%d record(s) left for a step that ran during the shutdown drain, want 0; the next start would run it again", n)
 	}
 }

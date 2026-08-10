@@ -40,6 +40,22 @@ func (ctxAction) Do(ctx context.Context, _ eventbus.Event) error {
 }
 func (ctxAction) Kind() string { return "test" }
 
+// gatedAction occupies a worker until the test opens its gate or the pool
+// cancels the context, whichever happens first. The gate is for a test that
+// has to let the worker go at a chosen moment while the pool is still running;
+// the context arm is what keeps a failed assertion before that moment from
+// leaving the worker pinned and hanging Pool.Stop.
+type gatedAction struct{ gate <-chan struct{} }
+
+func (a gatedAction) Do(ctx context.Context, _ eventbus.Event) error {
+	select {
+	case <-a.gate:
+	case <-ctx.Done():
+	}
+	return nil
+}
+func (gatedAction) Kind() string { return "test" }
+
 type recorder struct {
 	mu   sync.Mutex
 	seen []string

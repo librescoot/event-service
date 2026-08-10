@@ -130,6 +130,7 @@ run rather than two. A step that comes due when the action pool has no room
 for it keeps its record instead: it provably did not run, so the next start is
 what runs it, and the same goes for a step still sitting in the pool's queue
 when the service is stopped.
+
 Write `durable = false` on the step to opt out, and note that nothing is
 recorded for a `repeat` gap or for a trigger sitting in a `queue` backlog:
 neither has acted on the vehicle yet. `durable` on a step without `after`

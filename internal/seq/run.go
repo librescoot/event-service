@@ -496,9 +496,20 @@ func (rn *Runner) runStep(r *run, idx int, step CompiledStep) {
 		return
 	}
 	act := step.Action
-	if r.rec {
-		act = recordDropper{rn: rn, run: r, inner: act}
+	// The record comes off the run here, under the same lock that decided the
+	// run is still live, and goes to the wrapper. Ownership has to move now
+	// rather than when the action starts: Stop claims whatever a run still
+	// holds and leaves the record itself in place, so a wrapper that went
+	// looking for the record on a worker would find the run no longer owning
+	// it and would leave behind exactly the record its own action is making
+	// stale.
+	if ref := claimRecordLocked(r); ref.id != "" {
+		act = recordDropper{rn: rn, ref: ref, inner: act}
 	}
+	// From here the record has one owner, and it is not this run any more. If
+	// the job is accepted, the wrapper removes it as the step starts. If it is
+	// refused, the wrapper goes with the job and nobody removes it, which is
+	// the point: that step did not run.
 	submitted := rn.pool.Submit(act, r.event, name, func(err error) {
 		if err != nil {
 			// A sequence is a recipe, so a failed step ends it. Carrying on
@@ -516,25 +527,36 @@ func (rn *Runner) runStep(r *run, idx int, step CompiledStep) {
 	if !submitted {
 		// A refused job never calls done, so no callback is coming to move
 		// this run along: end it here. The pool counts the refusal. Retrying
-		// would only push at a queue that is already full.
+		// would only push at a queue that is already full. Ending does not
+		// touch the record, because the run stopped owning it above; it stays
+		// in the datastore for the next start, which is the only thing left
+		// that can run this step.
 		rn.log.Printf("rule %s: step %d refused by the action pool, run ends", name, idx)
-		rn.endKeepingRecord(r)
+		rn.end(r)
 	}
 }
 
-// recordDropper removes a run's pending record as the step that record covers
+// recordDropper removes the pending record covering a step as that step
 // starts, then runs the step's own action. It wraps the action rather than
 // living in runStep because the moment that matters is the start of the work,
 // not the hand-off to the pool: a job the pool refused, or one abandoned in
 // its queue at shutdown, must still be covered, while a step whose action has
 // begun must not be replayed on top of what it already did.
 //
+// The record it removes is the one captured when the wrapper was built, and it
+// removes it unconditionally. Between the hand-off and the worker picking the
+// job up, a Stop can decide the run no longer owns anything while leaving the
+// record where it is, and workers keep draining the queue across the gap
+// between the runner stopping and the pool stopping. Asking again on the
+// worker would come back empty there and leave the record behind for a step
+// that is running right now. Removing a field that is already gone costs one
+// no-op; missing one runs a rule's action a second time at the next start.
+//
 // It runs on a worker, which is why the datastore round trip is safe here: the
-// bus subscriber is not waiting on it and the runner mutex is not held across
-// it.
+// bus subscriber is not waiting on it and the runner mutex is not held.
 type recordDropper struct {
 	rn    *Runner
-	run   *run
+	ref   pendingRef
 	inner action.Action
 }
 
@@ -543,29 +565,19 @@ type recordDropper struct {
 func (d recordDropper) Kind() string { return d.inner.Kind() }
 
 func (d recordDropper) Do(ctx context.Context, e eventbus.Event) error {
-	d.rn.mu.Lock()
-	ref := claimRecordLocked(d.run)
-	d.rn.mu.Unlock()
-
-	d.rn.dropRecord(ref)
+	d.rn.dropRecord(d.ref)
 	return d.inner.Do(ctx, e)
 }
 
-// end finishes a run, removes whatever pending record it was still holding,
-// and starts whatever its rule has queued behind it.
-func (rn *Runner) end(r *run) { rn.finish(r, true) }
-
-// endKeepingRecord finishes a run and leaves its pending record in the
-// datastore for the next start to pick up. It is for the one case where a run
-// ends with a recorded step that provably never ran: the pool turned the step
-// away, so nothing acted on the vehicle and nothing can double-fire.
-func (rn *Runner) endKeepingRecord(r *run) { rn.finish(r, false) }
-
-// finish is the body both of those share. The promoted run is advanced after
-// the lock is dropped: advance takes the same mutex, and a completion callback
-// reaching this point is already deep enough in the call stack without holding
-// it further.
-func (rn *Runner) finish(r *run, dropRecord bool) {
+// end finishes a run, removes whatever pending record it still owns, and
+// starts whatever its rule has queued behind it. A run that has handed its
+// record to a submitted step owns nothing by the time it gets here, so what
+// ends such a run does not decide the record's fate; the step does.
+//
+// The promoted run is advanced after the lock is dropped: advance takes the
+// same mutex, and a completion callback reaching this point is already deep
+// enough in the call stack without holding it further.
+func (rn *Runner) end(r *run) {
 	var next *run
 
 	rn.mu.Lock()
@@ -575,9 +587,7 @@ func (rn *Runner) finish(r *run, dropRecord bool) {
 	}
 	rn.mu.Unlock()
 
-	if dropRecord {
-		rn.dropRecord(ref)
-	}
+	rn.dropRecord(ref)
 
 	if next != nil {
 		rn.advance(next)
@@ -594,10 +604,9 @@ func (rn *Runner) finish(r *run, dropRecord bool) {
 // The run's pending record is claimed but not removed: this is the tail-cancel
 // point every finishing run goes through, and a datastore round trip under the
 // runner mutex would be paid by every other rule on a one-core box. The caller
-// removes what it is handed, once it has dropped the lock. Two callers
-// deliberately do not: Stop, and the end of a run whose step the pool refused.
-// Both leave behind a step that has not run, and the record is what runs it at
-// the next start.
+// removes what it is handed, once it has dropped the lock. Stop is the one
+// caller that deliberately does not: a step still waiting out its delay has
+// not run, and leaving its record is what lets the next start run it.
 //
 // It does not touch the rule's queue. A caller that ends a run because the
 // sequence finished wants the next queued trigger to start; one that ends it
@@ -759,16 +768,19 @@ func (rn *Runner) Replay(seqs []*Sequence, window time.Duration) int {
 // flight rather than how many records it walked.
 //
 // A record meets its rule's concurrency policy on the way in, the same as a
-// live trigger does. One replay can find several records for one rule, since a
-// removal that failed at the last shutdown leaves one behind that its run had
-// already finished with; without the gate a restart-policy rule resumes both
-// and pushes its tail twice.
+// live trigger does, and whatever the policy the rule comes back with one run
+// rather than several. One replay can find more than one record for a rule
+// only because a removal failed at the last shutdown, which leaves a record
+// behind that its run had already finished with, and both records then name
+// the same step: resuming them side by side runs one tail twice.
 //
-// Queue is the policy a record cannot honour. A backlog holds triggers, and a
-// trigger starts a sequence at its first step, while a record continues one
-// from the middle against a deadline it is already part-way through. Holding
-// it behind the run in front would miss that deadline by however long that run
-// takes, so it resumes alongside instead.
+// Restart ends what is already resumed and takes the newer record, as a live
+// restart takes the newer trigger. Drop and queue both keep the first and
+// throw the rest away. Queue has nothing to queue behind: a backlog is memory
+// only and never survives a restart, so at replay there is no backlog to join,
+// and holding two records for one rule side by side is the overlap that policy
+// exists to forbid. Records are walked earliest deadline first, so the one
+// kept is the one whose wait runs out first.
 func (rn *Runner) resume(s *Sequence, p Pending, remaining time.Duration) (started bool, replaced int) {
 	name := s.Rule.Name
 	r := &run{
@@ -795,14 +807,11 @@ func (rn *Runner) resume(s *Sequence, p Pending, remaining time.Duration) (start
 	}
 	if len(rn.runs[name]) > 0 {
 		switch s.Rule.Concurrency {
-		case rules.PolicyDrop:
+		case rules.PolicyDrop, rules.PolicyQueue:
 			rn.mu.Unlock()
-			rn.log.Printf("pending %s: rule %s already has a resumed run in flight and drops what overlaps it, dropped", p.ID, name)
+			rn.log.Printf("pending %s: rule %s has a resumed run in flight already and its concurrency is %s, dropped", p.ID, name, s.Rule.Concurrency)
 			rn.dropRecord(pendingRef{id: p.ID, rule: p.Rule, step: p.Step})
 			return false, 0
-
-		case rules.PolicyQueue:
-			// Resumed alongside, for the reason in this function's comment.
 
 		default:
 			// Restart. Copied out before the walk, because endLocked edits the
