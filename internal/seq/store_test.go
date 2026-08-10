@@ -1098,3 +1098,309 @@ func TestCorruptPendingJsonIsDroppedAndLoggedNotFatal(t *testing.T) {
 		t.Error("an unreadable record must be removed, or it is logged again on every boot")
 	}
 }
+
+// TestARefusedStepKeepsItsRecord is the failure durability exists to prevent,
+// arriving through the pool rather than through a shutdown. The step that
+// turns the hazards off again comes due, the pool has nowhere to put it, and
+// the run ends. Nothing ran, so the record is the only thing left in the
+// system that can still turn them off, and dropping it leaves the vehicle
+// latched with no restart able to recover it.
+//
+// The record is seeded past due and the pool is filled before the replay, so
+// the refusal happens inside Replay itself and the test waits on no timer.
+func TestARefusedStepKeepsItsRecord(t *testing.T) {
+	log := &capturingLog{}
+	st, _ := memStore(t, log)
+	rec := &recorder{}
+	s := replaySeq(t, rec)
+
+	if err := st.Put(Pending{
+		ID: "off", Rule: "hazards", Step: 1,
+		FireAt:      time.Now().Add(-time.Second).UnixMilli(),
+		Fingerprint: fingerprintOf(s, 1),
+		Event:       eventbus.Event{Topic: "alarm.triggered"},
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// One worker, one queue slot, and both taken: the pinned job holds the
+	// worker until the pool's own context is cancelled, and the second sits in
+	// the queue behind it.
+	pool := startedPool(t, 1, 1)
+	if !pool.Submit(ctxAction{}, eventbus.Event{}, "pin", nil) {
+		t.Fatal("the pinning job was refused by an empty pool")
+	}
+	waitFor(t, "the pinning job to reach the worker", func() bool { return pool.Stats().Dispatched == 1 })
+	if !pool.Submit(ctxAction{}, eventbus.Event{}, "fill", nil) {
+		t.Fatal("the filling job was refused by an empty queue")
+	}
+
+	rn := NewRunner(pool, testSched(t), st, log)
+	if n := rn.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
+		t.Fatalf("Replay resumed %d step(s), want 1", n)
+	}
+
+	if got := rn.Active(); got != 0 {
+		t.Errorf("Active() = %d after the refusal, want 0; a refused step ends its run", got)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("steps ran as %v, want none; the pool had no room for the step", got)
+	}
+	if n := countPending(t, st); n != 1 {
+		t.Fatalf("%d record(s) after a refused step, want 1; the step never ran, so its record is the only thing that can still run it", n)
+	}
+
+	// And the record is worth keeping: a start with room in the pool finishes
+	// the sequence off it.
+	next := NewRunner(startedPool(t, 1, 8), testSched(t), st, log)
+	if n := next.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
+		t.Fatalf("the next start resumed %d step(s), want 1", n)
+	}
+	waitFor(t, "the resumed run to end", func() bool { return next.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"two", "three"}) {
+		t.Errorf("steps ran as %v at the next start, want two, three", got)
+	}
+	if n := countPending(t, st); n != 0 {
+		t.Errorf("%d record(s) once the step finally ran, want 0", n)
+	}
+}
+
+// TestAStepAbandonedInThePoolQueueKeepsItsRecord is the same hazard one step
+// further along. The step was accepted, so it is queued rather than refused,
+// and then every worker leaves before one reaches it: shutting down while a
+// worker is busy abandons whatever is behind it. That step has not run either,
+// so its record has to outlive the process the same way.
+//
+// The pinned job waits on the pool's own context rather than on a gate, so the
+// worker lets go exactly when Stop reaches it and cannot drain the queue on
+// the way out.
+func TestAStepAbandonedInThePoolQueueKeepsItsRecord(t *testing.T) {
+	log := &capturingLog{}
+	st, _ := memStore(t, log)
+	rec := &recorder{}
+	s := replaySeq(t, rec)
+
+	if err := st.Put(Pending{
+		ID: "off", Rule: "hazards", Step: 1,
+		FireAt:      time.Now().Add(-time.Second).UnixMilli(),
+		Fingerprint: fingerprintOf(s, 1),
+		Event:       eventbus.Event{Topic: "alarm.triggered"},
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	pool := startedPool(t, 1, 4)
+	if !pool.Submit(ctxAction{}, eventbus.Event{}, "pin", nil) {
+		t.Fatal("the pinning job was refused by an empty pool")
+	}
+	waitFor(t, "the pinning job to reach the worker", func() bool { return pool.Stats().Dispatched == 1 })
+
+	rn := NewRunner(pool, testSched(t), st, log)
+	if n := rn.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
+		t.Fatalf("Replay resumed %d step(s), want 1", n)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("steps ran as %v while the only worker was pinned, want none", got)
+	}
+
+	// Shutdown order, as main has it: the runner first, then the pool.
+	rn.Stop()
+	pool.Stop()
+
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("steps ran as %v across the shutdown, want none; the queued step was abandoned", got)
+	}
+	if n := countPending(t, st); n != 1 {
+		t.Fatalf("%d record(s) after a step was abandoned in the pool queue, want 1", n)
+	}
+}
+
+// TestReplayDropsAnEntryDatedFurtherAheadThanItsStepCouldWait pins the far
+// side of the replay window. A deadline is the moment of the write plus the
+// step's own after, so nothing legitimate can sit further ahead than that
+// after; a record that does means the clock ran backwards over the restart.
+// Resumed verbatim it parks for the length of the jump, holding the rule's
+// concurrency slot and its own record, and every reboot arms it again.
+func TestReplayDropsAnEntryDatedFurtherAheadThanItsStepCouldWait(t *testing.T) {
+	log := &capturingLog{}
+	st, _ := memStore(t, log)
+	rec := &recorder{}
+	s := replaySeq(t, rec)
+
+	if err := st.Put(Pending{
+		ID: "next-year", Rule: "hazards", Step: 1,
+		FireAt:      time.Now().Add(365 * 24 * time.Hour).UnixMilli(),
+		Fingerprint: fingerprintOf(s, 1),
+		Event:       eventbus.Event{Topic: "alarm.triggered"},
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, st, log)
+	if n := rn.Replay([]*Sequence{s}, 5*time.Minute); n != 0 {
+		t.Errorf("Replay resumed %d step(s), want 0; the step waits an hour and this record is a year out", n)
+	}
+	if n := countPending(t, st); n != 0 {
+		t.Errorf("%d record(s) left for a future-dated entry, want 0; it survives every reboot otherwise", n)
+	}
+	if got := sch.Pending(); got != 0 {
+		t.Errorf("scheduler has %d pending fire(s), want 0", got)
+	}
+	if got := rn.Active(); got != 0 {
+		t.Errorf("Active() = %d, want 0; a phantom run blocks a drop-policy rule for good", got)
+	}
+	if !log.contains("next-year") {
+		t.Errorf("the drop must name the record, got:\n%s", log.all())
+	}
+}
+
+// TestANegativeReplayWindowMeansTheSameAsZero pins the flag against reading
+// itself backwards. Zero replays only what is still in the future; anything
+// below zero says the same thing, and must not start dropping future steps for
+// being past a limit that is itself in the past.
+func TestANegativeReplayWindowMeansTheSameAsZero(t *testing.T) {
+	log := &capturingLog{}
+	st, _ := memStore(t, log)
+	rec := &recorder{}
+	s := replaySeq(t, rec)
+
+	now := time.Now()
+	for id, at := range map[string]time.Time{
+		"past":   now.Add(-50 * time.Millisecond),
+		"future": now.Add(80 * time.Millisecond),
+	} {
+		if err := st.Put(Pending{
+			ID: id, Rule: "hazards", Step: 1,
+			FireAt:      at.UnixMilli(),
+			Fingerprint: fingerprintOf(s, 1),
+			Event:       eventbus.Event{Topic: "alarm.triggered"},
+		}); err != nil {
+			t.Fatalf("Put %s: %v", id, err)
+		}
+	}
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, st, log)
+	if n := rn.Replay([]*Sequence{s}, -time.Minute); n != 1 {
+		t.Errorf("Replay resumed %d step(s) with a negative window, want 1: the one still in the future", n)
+	}
+	if got := sch.Pending(); got != 1 {
+		t.Errorf("scheduler has %d pending fire(s), want 1", got)
+	}
+	got := loadAll(t, st)
+	if len(got) != 1 || got[0].ID != "future" {
+		t.Fatalf("records after a negative-window replay are %+v, want only future", got)
+	}
+
+	waitFor(t, "the future record to run", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"two", "three"}) {
+		t.Errorf("steps ran as %v, want two, three", got)
+	}
+}
+
+// TestReplayAppliesTheRestartPolicyAcrossTwoRecords: one rule can end up with
+// two records, because a removal that failed at the last shutdown leaves one
+// behind that its run had already finished with. A live trigger meeting a run
+// in flight goes through the rule's concurrency policy, and a resumed record
+// has to go through the same gate, or a restart-policy rule comes back up
+// running its tail twice.
+func TestReplayAppliesTheRestartPolicyAcrossTwoRecords(t *testing.T) {
+	log := &capturingLog{}
+	st, _ := memStore(t, log)
+	rec := &recorder{}
+	s := replaySeq(t, rec)
+
+	now := time.Now()
+	for id, at := range map[string]time.Time{
+		"first":  now.Add(60 * time.Millisecond),
+		"second": now.Add(120 * time.Millisecond),
+	} {
+		if err := st.Put(Pending{
+			ID: id, Rule: "hazards", Step: 1,
+			FireAt:      at.UnixMilli(),
+			Fingerprint: fingerprintOf(s, 1),
+			Event:       eventbus.Event{Topic: "alarm.triggered"},
+		}); err != nil {
+			t.Fatalf("Put %s: %v", id, err)
+		}
+	}
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, st, log)
+	if n := rn.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
+		t.Errorf("Replay reported %d resumed step(s), want 1; restart leaves one run, not two", n)
+	}
+	if got := rn.Active(); got != 1 {
+		t.Errorf("Active() = %d after replaying two records for one restart rule, want 1", got)
+	}
+	if got := sch.Pending(); got != 1 {
+		t.Errorf("scheduler has %d pending fire(s), want 1; the replaced run's tail must be cancelled", got)
+	}
+	// Records are replayed oldest deadline first, so the newest is the one
+	// left standing, exactly as a live restart keeps the newest trigger.
+	got := loadAll(t, st)
+	if len(got) != 1 || got[0].ID != "second" {
+		t.Fatalf("records after the replay are %+v, want only second", got)
+	}
+
+	waitFor(t, "the surviving run to end", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"two", "three"}) {
+		t.Errorf("steps ran as %v, want two, three once; a replay must not fire the tail twice", got)
+	}
+}
+
+// TestReplayAppliesTheDropPolicyAcrossTwoRecords is the same gate under the
+// other policy: a drop-policy rule ignores what overlaps a live run, so the
+// second record is thrown away rather than resumed alongside. Throwing it away
+// means removing it, or it comes back at every boot to be thrown away again.
+func TestReplayAppliesTheDropPolicyAcrossTwoRecords(t *testing.T) {
+	log := &capturingLog{}
+	st, _ := memStore(t, log)
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "hazards", On: []string{"alarm.triggered"}, Concurrency: "drop",
+		Steps: []rules.StepConfig{
+			push("a", "1"),
+			{Do: "redis", List: "b", Push: "2", After: "1h"},
+			push("c", "3"),
+		},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"), rec.step("three"))
+
+	now := time.Now()
+	for id, at := range map[string]time.Time{
+		"first":  now.Add(60 * time.Millisecond),
+		"second": now.Add(120 * time.Millisecond),
+	} {
+		if err := st.Put(Pending{
+			ID: id, Rule: "hazards", Step: 1,
+			FireAt:      at.UnixMilli(),
+			Fingerprint: fingerprintOf(s, 1),
+			Event:       eventbus.Event{Topic: "alarm.triggered"},
+		}); err != nil {
+			t.Fatalf("Put %s: %v", id, err)
+		}
+	}
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, st, log)
+	if n := rn.Replay([]*Sequence{s}, 5*time.Minute); n != 1 {
+		t.Errorf("Replay reported %d resumed step(s), want 1; a drop rule takes the first and ignores the rest", n)
+	}
+	if got := sch.Pending(); got != 1 {
+		t.Errorf("scheduler has %d pending fire(s), want 1", got)
+	}
+	got := loadAll(t, st)
+	if len(got) != 1 || got[0].ID != "first" {
+		t.Fatalf("records after the replay are %+v, want only first", got)
+	}
+	if !log.contains("second") {
+		t.Errorf("the dropped record must be logged, got:\n%s", log.all())
+	}
+
+	waitFor(t, "the surviving run to end", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"two", "three"}) {
+		t.Errorf("steps ran as %v, want two, three once", got)
+	}
+}

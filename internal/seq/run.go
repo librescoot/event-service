@@ -1,7 +1,9 @@
 package seq
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -345,11 +347,9 @@ func (rn *Runner) park(r *run, idx int, step CompiledStep, d time.Duration) {
 	rn.mu.Unlock()
 }
 
-// fireDeferred is what a parked step's timer runs. The record goes as the
-// step is claimed, not once its action has finished: what is recorded is the
-// wait, and the wait is over. A step already handed to the pool is the pool's
-// to run or abandon, and re-running it on the next boot because a worker was
-// cut short mid-action would fire hardware twice.
+// fireDeferred is what a parked step's timer runs. The wait it recorded is
+// over, so the timer's own cancel goes, and the step is handed to runStep,
+// which owns the record from there.
 func (rn *Runner) fireDeferred(r *run, idx int, step CompiledStep) {
 	rn.mu.Lock()
 	if r.ended || rn.stopped {
@@ -357,10 +357,8 @@ func (rn *Runner) fireDeferred(r *run, idx int, step CompiledStep) {
 		return
 	}
 	r.cancelTail = nil
-	ref := claimRecordLocked(r)
 	rn.mu.Unlock()
 
-	rn.dropRecord(ref)
 	rn.runStep(r, idx, step)
 }
 
@@ -456,6 +454,19 @@ func (rn *Runner) dropRecords(refs []pendingRef) {
 // runStep evaluates a step's when, if it has one, and submits it. advance
 // calls it directly for a step with no delay; fireDeferred calls it once a
 // parked step's wait is over.
+//
+// A run that is holding a pending record keeps it until the step that record
+// covers actually starts on a worker, which is later than the hand-off to the
+// pool. Two things between here and there leave the step not having run: the
+// pool refuses the job outright when its queue is full or it is stopping, and
+// a job that was accepted into the queue is abandoned rather than run if every
+// worker leaves before one reaches it. Neither has touched the vehicle, the
+// record is the only thing left that can finish the sequence, and replaying a
+// step that never started cannot fire the same hardware twice.
+//
+// A step whose when is false, or which fails to evaluate, is the other case:
+// that run is over by decision rather than by accident, so end takes the
+// record with it.
 func (rn *Runner) runStep(r *run, idx int, step CompiledStep) {
 	name := r.seq.Rule.Name
 
@@ -484,7 +495,11 @@ func (rn *Runner) runStep(r *run, idx int, step CompiledStep) {
 		rn.mu.Unlock()
 		return
 	}
-	submitted := rn.pool.Submit(step.Action, r.event, name, func(err error) {
+	act := step.Action
+	if r.rec {
+		act = recordDropper{rn: rn, run: r, inner: act}
+	}
+	submitted := rn.pool.Submit(act, r.event, name, func(err error) {
 		if err != nil {
 			// A sequence is a recipe, so a failed step ends it. Carrying on
 			// would run "turn the hazards off" against a state the earlier
@@ -503,15 +518,54 @@ func (rn *Runner) runStep(r *run, idx int, step CompiledStep) {
 		// this run along: end it here. The pool counts the refusal. Retrying
 		// would only push at a queue that is already full.
 		rn.log.Printf("rule %s: step %d refused by the action pool, run ends", name, idx)
-		rn.end(r)
+		rn.endKeepingRecord(r)
 	}
 }
 
-// end finishes a run and starts whatever its rule has queued behind it. The
-// promoted run is advanced after the lock is dropped: advance takes the same
-// mutex, and a completion callback reaching this point is already deep enough
-// in the call stack without holding it further.
-func (rn *Runner) end(r *run) {
+// recordDropper removes a run's pending record as the step that record covers
+// starts, then runs the step's own action. It wraps the action rather than
+// living in runStep because the moment that matters is the start of the work,
+// not the hand-off to the pool: a job the pool refused, or one abandoned in
+// its queue at shutdown, must still be covered, while a step whose action has
+// begun must not be replayed on top of what it already did.
+//
+// It runs on a worker, which is why the datastore round trip is safe here: the
+// bus subscriber is not waiting on it and the runner mutex is not held across
+// it.
+type recordDropper struct {
+	rn    *Runner
+	run   *run
+	inner action.Action
+}
+
+// Kind reports the wrapped action's kind, so the pool's own log lines name
+// what the rule author wrote rather than this wrapper.
+func (d recordDropper) Kind() string { return d.inner.Kind() }
+
+func (d recordDropper) Do(ctx context.Context, e eventbus.Event) error {
+	d.rn.mu.Lock()
+	ref := claimRecordLocked(d.run)
+	d.rn.mu.Unlock()
+
+	d.rn.dropRecord(ref)
+	return d.inner.Do(ctx, e)
+}
+
+// end finishes a run, removes whatever pending record it was still holding,
+// and starts whatever its rule has queued behind it.
+func (rn *Runner) end(r *run) { rn.finish(r, true) }
+
+// endKeepingRecord finishes a run and leaves its pending record in the
+// datastore for the next start to pick up. It is for the one case where a run
+// ends with a recorded step that provably never ran: the pool turned the step
+// away, so nothing acted on the vehicle and nothing can double-fire.
+func (rn *Runner) endKeepingRecord(r *run) { rn.finish(r, false) }
+
+// finish is the body both of those share. The promoted run is advanced after
+// the lock is dropped: advance takes the same mutex, and a completion callback
+// reaching this point is already deep enough in the call stack without holding
+// it further.
+func (rn *Runner) finish(r *run, dropRecord bool) {
 	var next *run
 
 	rn.mu.Lock()
@@ -521,7 +575,9 @@ func (rn *Runner) end(r *run) {
 	}
 	rn.mu.Unlock()
 
-	rn.dropRecord(ref)
+	if dropRecord {
+		rn.dropRecord(ref)
+	}
 
 	if next != nil {
 		rn.advance(next)
@@ -538,8 +594,10 @@ func (rn *Runner) end(r *run) {
 // The run's pending record is claimed but not removed: this is the tail-cancel
 // point every finishing run goes through, and a datastore round trip under the
 // runner mutex would be paid by every other rule on a one-core box. The caller
-// removes what it is handed, once it has dropped the lock. Stop is the one
-// caller that deliberately does not.
+// removes what it is handed, once it has dropped the lock. Two callers
+// deliberately do not: Stop, and the end of a run whose step the pool refused.
+// Both leave behind a step that has not run, and the record is what runs it at
+// the next start.
 //
 // It does not touch the rule's queue. A caller that ends a run because the
 // sequence finished wants the next queued trigger to start; one that ends it
@@ -602,23 +660,41 @@ func (rn *Runner) startQueuedLocked(name string) *run {
 //
 // A record is dropped, with a line saying why, when the rule it names is no
 // longer loaded, when the rule no longer has the step it indexes, when the
-// step at that index is not the step the record was written for any more, or
-// when it is more than window past due. The middle two are one situation: a
-// user is free to edit their rule files while the service is down, and a
-// record whose step moved or was rewritten must not fire whatever took its
-// place. The last is the important limit: a scooter that was off for a week
-// must not come back up and start acting on what it was in the middle of
-// doing back then. Anything left is resumed on the run it belonged to,
-// keeping its id, so the record still covers it until it fires.
+// step at that index is not the step the record was written for any more, when
+// it is more than window past due, or when it is dated further ahead than the
+// step it names could ever wait. The middle two are one situation: a user is
+// free to edit their rule files while the service is down, and a record whose
+// step moved or was rewritten must not fire whatever took its place. The last
+// two are the limits on the clock in both directions. Anything left is resumed
+// on the run it belonged to, keeping its id, so the record still covers it
+// until it fires.
 func (rn *Runner) Replay(seqs []*Sequence, window time.Duration) int {
 	if rn.store == nil {
 		return 0
+	}
+	// A window below zero means what a window of zero means: replay only what
+	// is still in the future. Taken literally it inverts instead, and a step
+	// due twenty seconds from now is thrown away for being past a limit that
+	// is itself in the past.
+	if window < 0 {
+		window = 0
 	}
 	recs, err := rn.store.Load()
 	if err != nil {
 		rn.log.Printf("pending: %v", err)
 		return 0
 	}
+
+	// Earliest deadline first. The hash hands its fields back in whatever
+	// order it likes, and a rule with more than one record resolves its
+	// concurrency policy against whichever came first, so without this the
+	// same two records can replay differently on two boots.
+	sort.Slice(recs, func(i, j int) bool {
+		if recs[i].FireAt != recs[j].FireAt {
+			return recs[i].FireAt < recs[j].FireAt
+		}
+		return recs[i].ID < recs[j].ID
+	})
 
 	byName := make(map[string]*Sequence, len(seqs))
 	for _, s := range seqs {
@@ -652,11 +728,25 @@ func (rn *Runner) Replay(seqs []*Sequence, window time.Duration) int {
 			rn.dropRecord(ref)
 			continue
 		}
-
-		if !rn.resume(s, p, due.Sub(now)) {
+		// A deadline is written as the moment of the write plus the step's own
+		// after, so it can never sit further ahead than that after. Further
+		// means the clock jumped backwards over the restart, which a flat
+		// backup rail on the real-time clock is enough to do. Resuming such a
+		// record parks the run for the length of the jump, and for as long as
+		// it is parked the rule holds a concurrency slot, a runs-active count
+		// and the record itself, which survives every reboot and re-arms the
+		// same wait each time.
+		if ahead := due.Sub(now); ahead > s.Steps[p.Step].After {
+			rn.log.Printf("pending %s: rule %s step %d is dated %v ahead, longer than the %v it waits, dropped", p.ID, p.Rule, p.Step, ahead.Round(time.Second), s.Steps[p.Step].After)
+			rn.dropRecord(ref)
 			continue
 		}
-		n++
+
+		started, replaced := rn.resume(s, p, due.Sub(now))
+		n -= replaced
+		if started {
+			n++
+		}
 	}
 	return n
 }
@@ -664,8 +754,23 @@ func (rn *Runner) Replay(seqs []*Sequence, window time.Duration) int {
 // resume registers a run for a record and either fires its step, if the delay
 // has already run out, or parks what is left of it. The record stays where it
 // is: the resumed run carries the same id, so it is still covered until the
-// step actually fires.
-func (rn *Runner) resume(s *Sequence, p Pending, remaining time.Duration) bool {
+// step actually fires. It reports whether the record started a run, and how
+// many already-resumed runs that cost, so Replay's count is what ends up in
+// flight rather than how many records it walked.
+//
+// A record meets its rule's concurrency policy on the way in, the same as a
+// live trigger does. One replay can find several records for one rule, since a
+// removal that failed at the last shutdown leaves one behind that its run had
+// already finished with; without the gate a restart-policy rule resumes both
+// and pushes its tail twice.
+//
+// Queue is the policy a record cannot honour. A backlog holds triggers, and a
+// trigger starts a sequence at its first step, while a record continues one
+// from the middle against a deadline it is already part-way through. Holding
+// it behind the run in front would miss that deadline by however long that run
+// takes, so it resumes alongside instead.
+func (rn *Runner) resume(s *Sequence, p Pending, remaining time.Duration) (started bool, replaced int) {
+	name := s.Rule.Name
 	r := &run{
 		seq:   s,
 		event: p.Event,
@@ -681,23 +786,54 @@ func (rn *Runner) resume(s *Sequence, p Pending, remaining time.Duration) bool {
 		recStep: p.Step,
 	}
 
+	var replacedRecords []pendingRef
+
 	rn.mu.Lock()
 	if rn.stopped {
 		rn.mu.Unlock()
-		return false
+		return false, 0
 	}
-	rn.runs[s.Rule.Name] = append(rn.runs[s.Rule.Name], r)
+	if len(rn.runs[name]) > 0 {
+		switch s.Rule.Concurrency {
+		case rules.PolicyDrop:
+			rn.mu.Unlock()
+			rn.log.Printf("pending %s: rule %s already has a resumed run in flight and drops what overlaps it, dropped", p.ID, name)
+			rn.dropRecord(pendingRef{id: p.ID, rule: p.Rule, step: p.Step})
+			return false, 0
+
+		case rules.PolicyQueue:
+			// Resumed alongside, for the reason in this function's comment.
+
+		default:
+			// Restart. Copied out before the walk, because endLocked edits the
+			// slice it is in.
+			for _, other := range append([]*run(nil), rn.runs[name]...) {
+				ended, ref := rn.endLocked(other)
+				if ended {
+					replaced++
+				}
+				if ref.id != "" {
+					replacedRecords = append(replacedRecords, ref)
+				}
+			}
+		}
+	}
+	rn.runs[name] = append(rn.runs[name], r)
 	rn.mu.Unlock()
+
+	// The replaced runs' records go once the lock is down, for the same reason
+	// a live restart drops them: nothing will fire their tails now.
+	rn.dropRecords(replacedRecords)
 
 	step := s.Steps[p.Step]
 	if remaining <= 0 {
 		rn.log.Printf("rule %s: step %d was due while the service was down, running it now", p.Rule, p.Step)
 		rn.fireDeferred(r, p.Step, step)
-		return true
+		return true, replaced
 	}
 	rn.log.Printf("rule %s: step %d resumed, %v left to wait", p.Rule, p.Step, remaining.Round(time.Millisecond))
 	rn.park(r, p.Step, step, remaining)
-	return true
+	return true, replaced
 }
 
 // Active is how many runs are part-way through their steps, including a run

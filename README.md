@@ -114,13 +114,22 @@ and finishes the passes it had left, rather than starting its count over.
 
 A record is thrown away instead, with a line saying why, if its rule is gone,
 if its rule no longer has that step, if the step at that index is not the one
-the record was written for any more, or if it is more than `--replay-window`
-(5 minutes by default) past due. Editing a rule file while the service is down
+the record was written for any more, if it is more than `--replay-window`
+(5 minutes by default) past due, or if it is dated further ahead than the
+step's own `after` could put it, which is what a clock that ran backwards over
+the restart leaves behind. Editing a rule file while the service is down
 is expected, and a record identifies its step by what that step was configured
 to do, so reordering or rewriting steps drops the record rather than firing
 whatever ended up at the same index. A window of zero or less replays only
 what is still in the future: a scooter that was off for a week must not come
 back up acting on what it was doing then.
+
+A replayed record goes through its rule's `concurrency` policy the same way a
+live trigger does, so a rule that ends up with two records comes back with one
+run rather than two. A step that comes due when the action pool has no room
+for it keeps its record instead: it provably did not run, so the next start is
+what runs it, and the same goes for a step still sitting in the pool's queue
+when the service is stopped.
 Write `durable = false` on the step to opt out, and note that nothing is
 recorded for a `repeat` gap or for a trigger sitting in a `queue` backlog:
 neither has acted on the vehicle yet. `durable` on a step without `after`
