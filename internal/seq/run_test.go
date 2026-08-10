@@ -306,7 +306,7 @@ func TestStepWithAfterDoesNotRunImmediately(t *testing.T) {
 	rec := &recorder{}
 	r := compileRule(t, rules.RuleConfig{
 		Name: "r", On: []string{"x.y"},
-		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "30ms"}},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "100ms"}},
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
@@ -314,9 +314,9 @@ func TestStepWithAfterDoesNotRunImmediately(t *testing.T) {
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
-	// Well short of the 30ms delay: a step with after must not be submitted
-	// the moment the step before it finishes.
-	time.Sleep(10 * time.Millisecond)
+	// A wide margin short of the 100ms delay: a step with after must not be
+	// submitted the moment the step before it finishes.
+	time.Sleep(20 * time.Millisecond)
 	if got := rec.list(); !equal(got, []string{"one"}) {
 		t.Errorf("steps ran as %v before the delay elapsed, want only one", got)
 	}
@@ -405,11 +405,16 @@ func TestPendingStepOccupiesNoWorker(t *testing.T) {
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
 }
 
+// TestRunnerStopCancelsAPendingTail uses an hour-long after so the timer
+// cannot possibly have fired by the time Stop returns. Pending is checked
+// immediately, with no sleep in between: any margin here would let the
+// timer's own self-removal on fire, rather than Stop's cancel, account for
+// an empty registry, which proves nothing about Stop.
 func TestRunnerStopCancelsAPendingTail(t *testing.T) {
 	rec := &recorder{}
 	r := compileRule(t, rules.RuleConfig{
 		Name: "r", On: []string{"x.y"},
-		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "30ms"}},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "1h"}},
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
@@ -420,13 +425,11 @@ func TestRunnerStopCancelsAPendingTail(t *testing.T) {
 	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
 	rn.Stop()
 
-	// Longer than the 30ms after: a surviving timer would have fired by now.
-	time.Sleep(60 * time.Millisecond)
-	if got := rec.list(); !equal(got, []string{"one"}) {
-		t.Errorf("steps ran as %v after Stop, want only one; Stop must cancel a pending tail", got)
-	}
 	if got := sch.Pending(); got != 0 {
-		t.Errorf("scheduler has %d pending fire(s) after Stop, want 0", got)
+		t.Errorf("scheduler has %d pending fire(s) right after Stop, want 0; Stop must cancel a pending tail", got)
+	}
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v after Stop, want only one", got)
 	}
 }
 
