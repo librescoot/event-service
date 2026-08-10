@@ -45,8 +45,10 @@ type Engine struct {
 // reported and dropped; the others still run, for the same reason a bad file
 // does not stop the good ones loading. sch parks the tail of any step that
 // carries an after delay, and the pending timer behind any rule's debounce.
-func New(rs []*rules.Rule, pool *action.Pool, sch *sched.Scheduler, c action.Pusher, log Logger) (*Engine, []error) {
-	en := &Engine{runner: seq.NewRunner(pool, sch, log), sch: sch, log: log}
+// store records the steps that are waiting so a restart can pick them up; a
+// nil store leaves the runner entirely in memory.
+func New(rs []*rules.Rule, pool *action.Pool, sch *sched.Scheduler, store *seq.PendingStore, c action.Pusher, log Logger) (*Engine, []error) {
+	en := &Engine{runner: seq.NewRunner(pool, sch, store, log), sch: sch, log: log}
 	var errs []error
 
 	for _, r := range rs {
@@ -62,6 +64,18 @@ func New(rs []*rules.Rule, pool *action.Pool, sch *sched.Scheduler, c action.Pus
 
 // RuleCount is how many rules are live.
 func (en *Engine) RuleCount() int { return len(en.bounds) }
+
+// Replay resumes the steps that were waiting when the service last went down
+// and returns how many it picked up. Call it before subscribing to the bus,
+// so a resumed step cannot race a live re-fire of the same rule; a record
+// more than window past due is dropped rather than run.
+func (en *Engine) Replay(window time.Duration) int {
+	seqs := make([]*seq.Sequence, 0, len(en.bounds))
+	for _, b := range en.bounds {
+		seqs = append(seqs, b.seq)
+	}
+	return en.runner.Replay(seqs, window)
+}
 
 // Patterns returns the PSUBSCRIBE patterns needed to see every topic any rule
 // mentions. Subscribing to exactly what is needed keeps an idle rule set from

@@ -59,6 +59,11 @@ type StepConfig struct {
 	After string `toml:"after"`
 	When  string `toml:"when"`
 
+	// Durable is a pointer so an omitted key is distinguishable from an
+	// explicit false: a step with after is durable unless its author says
+	// otherwise, and only a pointer can tell "said nothing" from "said no".
+	Durable *bool `toml:"durable"`
+
 	// redis
 	List string `toml:"list"`
 	Push string `toml:"push"`

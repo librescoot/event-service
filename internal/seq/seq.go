@@ -29,11 +29,14 @@ type Sequence struct {
 // CompiledStep is one step ready to submit. When is nil for a step with no
 // condition of its own. After is zero for a step that runs as soon as it is
 // reached; a step with After greater than zero parks on a timer for that
-// long before it is submitted.
+// long before it is submitted. Durable, which only a step with After can be,
+// puts that pending fire in the datastore so a restart during the wait can
+// pick it up again.
 type CompiledStep struct {
-	Action action.Action
-	When   *vm.Program
-	After  time.Duration
+	Action  action.Action
+	When    *vm.Program
+	After   time.Duration
+	Durable bool
 }
 
 // Build compiles every step of r. An error names the step index; the caller
@@ -52,7 +55,7 @@ func Build(r *rules.Rule, c action.Pusher) (*Sequence, error) {
 		if err != nil {
 			return nil, fmt.Errorf("step %d: %w", i, err)
 		}
-		s.Steps = append(s.Steps, CompiledStep{Action: a, When: step.When, After: step.After})
+		s.Steps = append(s.Steps, CompiledStep{Action: a, When: step.When, After: step.After, Durable: step.Durable})
 	}
 
 	return s, nil

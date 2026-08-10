@@ -92,7 +92,12 @@ func seqWith(t *testing.T, r *rules.Rule, acts ...action.Action) *Sequence {
 	}
 	s := &Sequence{Rule: r, Steps: make([]CompiledStep, len(acts))}
 	for i, a := range acts {
-		s.Steps[i] = CompiledStep{Action: a, When: r.Steps[i].When, After: r.Steps[i].After}
+		s.Steps[i] = CompiledStep{
+			Action:  a,
+			When:    r.Steps[i].When,
+			After:   r.Steps[i].After,
+			Durable: r.Steps[i].Durable,
+		}
 	}
 	return s
 }
@@ -143,7 +148,7 @@ func TestTwoStepsRunInOrder(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"), rec.step("three"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -160,7 +165,7 @@ func TestSecondStepDoesNotRunWhenFirstFails(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.failing("one", errors.New("boom")), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -181,7 +186,7 @@ func TestStepWhenFalseStopsTheRunWithoutError(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"), rec.step("three"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y", To: "parked"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -204,7 +209,7 @@ func TestStepWhenSeesTheTriggeringEvent(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{
 		Topic: "battery.inserted", From: "absent", To: "present",
 		Data: map[string]any{"slot": 1},
@@ -230,7 +235,7 @@ func TestStepWhenCanReadStateFromTheShadowStore(t *testing.T) {
 	}, sh.Get)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "motion.detected"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -262,7 +267,7 @@ func TestRunEndsWhenPoolRefusesAStep(t *testing.T) {
 	}}
 	s := seqWith(t, r, first, rec.step("two"))
 
-	rn := NewRunner(pool, testSched(t), nopLog{})
+	rn := NewRunner(pool, testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -288,7 +293,7 @@ func TestActiveCountsARunUntilItEnds(t *testing.T) {
 	}}
 	s := seqWith(t, r, blocking, rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	if n := rn.Active(); n != 1 {
@@ -315,7 +320,7 @@ func TestStopAbandonsRunsAndRefusesNewOnes(t *testing.T) {
 	}}
 	s := seqWith(t, r, blocking, rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	rn.Stop()
@@ -340,7 +345,7 @@ func TestStepWithAfterDoesNotRunImmediately(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
@@ -360,7 +365,7 @@ func TestStepWithAfterEventuallyRuns(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -389,7 +394,7 @@ func TestStepWhenIsReEvaluatedAtFireTimeNotAtScheduleTime(t *testing.T) {
 	}, sh.Get)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "motion.detected"})
 
 	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
@@ -413,7 +418,7 @@ func TestPendingStepOccupiesNoWorker(t *testing.T) {
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
 	pool := startedPool(t, 1, 8)
-	rn := NewRunner(pool, testSched(t), nopLog{})
+	rn := NewRunner(pool, testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
@@ -449,7 +454,7 @@ func TestRunnerStopCancelsAPendingTail(t *testing.T) {
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
 	sch := testSched(t)
-	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), sch, nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
@@ -477,7 +482,7 @@ func TestRestartCancelsThePendingTailAndStartsOver(t *testing.T) {
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
 	sch := testSched(t)
-	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), sch, nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the first run to park on its tail", func() bool { return sch.Pending() == 1 })
@@ -510,7 +515,7 @@ func TestRestartIsTheDefaultWhenConcurrencyIsOmitted(t *testing.T) {
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
 	sch := testSched(t)
-	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), sch, nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the first run to park on its tail", func() bool { return sch.Pending() == 1 })
@@ -547,7 +552,7 @@ func TestDropIgnoresAReFireWhileARunIsLive(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.gated("one", gate), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 2, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 2, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 	waitFor(t, "the first step to start", func() bool { return len(rec.list()) == 1 })
 
@@ -585,7 +590,7 @@ func TestQueueRunsSequencesBackToBack(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.gated("start", gate), rec.step("end"))
 
-	rn := NewRunner(startedPool(t, 2, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 2, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 	waitFor(t, "the first run to start", func() bool { return len(rec.list()) == 1 })
 
@@ -620,7 +625,7 @@ func TestQueueIsBoundedAndCountsRefusals(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.gated("run", gate))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 	waitFor(t, "the first run to start", func() bool { return len(rec.list()) == 1 })
 
@@ -655,7 +660,7 @@ func TestCancelOnDropsThePendingTail(t *testing.T) {
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
 	sch := testSched(t)
-	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), sch, nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
 
 	waitFor(t, "the run to park on its tail", func() bool { return sch.Pending() == 1 })
@@ -683,7 +688,7 @@ func TestCancelOnMatchesGlobs(t *testing.T) {
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
 	sch := testSched(t)
-	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), sch, nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
 	waitFor(t, "the run to park on its tail", func() bool { return sch.Pending() == 1 })
 
@@ -721,7 +726,7 @@ func TestCancelOnAlsoDropsQueuedFires(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.gated("run", gate))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
 	waitFor(t, "the first run to start", func() bool { return len(rec.list()) == 1 })
 	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
@@ -761,7 +766,7 @@ func TestStopDropsQueuedFires(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.gated("run", gate))
 
-	rn := NewRunner(startedPool(t, 2, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 2, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 	waitFor(t, "the first run to start", func() bool { return len(rec.list()) == 1 })
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
@@ -816,7 +821,7 @@ func TestCancelLandingMidStepDoesNotLetOneMoreStepFire(t *testing.T) {
 	two := fnAction{fn: func() error { close(twoRan); return nil }}
 	s := seqWith(t, r, rec.step("one"), two)
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
 
 	<-reached
@@ -848,7 +853,7 @@ func TestRepeatRunsTheWholeSequenceCountTimes(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -869,7 +874,7 @@ func TestRepeatWaitsEveryBetweenIterations(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"))
 
-	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the first pass to run", func() bool { return len(rec.list()) >= 1 })
@@ -903,7 +908,7 @@ func TestRepeatStopsWhenCancelledMidGap(t *testing.T) {
 	s := seqWith(t, r, rec.step("one"))
 
 	sch := testSched(t)
-	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), sch, nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "alarm.triggered"})
 
 	waitFor(t, "the run to park on its repeat gap", func() bool { return sch.Pending() == 1 })
@@ -939,7 +944,7 @@ func TestRepeatCountOneRunsOnePass(t *testing.T) {
 	s := seqWith(t, r, rec.step("one"))
 
 	sch := testSched(t)
-	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), sch, nil, nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })

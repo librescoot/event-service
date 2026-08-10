@@ -75,6 +75,22 @@ step before it finished. A step waiting out its delay holds no worker and no
 thread: it sits on a timer, so a rule can say "and thirty seconds later, turn
 it off" without occupying anything for thirty seconds.
 
+A step with `after` is also `durable` unless it says otherwise. The waiting
+step is written to the `extensions:pending` hash when it is scheduled and
+removed when it fires or is cancelled, so a service restart in the middle of
+the wait does not strand the vehicle half-changed: "hazards on, hazards off
+thirty seconds later" still turns them off if the service goes down at second
+five. On start, a recorded step whose delay has run out is run straight away
+and one still in the future waits out what is left of it, both before the
+first event is handled. A record is thrown away instead, with a line saying
+why, if its rule is gone, if its rule no longer has that step, or if it is
+more than `--replay-window` (5 minutes by default) past due: a scooter that
+was off for a week must not come back up acting on what it was doing then.
+Write `durable = false` on the step to opt out, and note that nothing is
+recorded for a `repeat` gap or for a trigger sitting in a `queue` backlog:
+neither has acted on the vehicle yet. `durable` on a step without `after`
+fails to load rather than doing nothing quietly.
+
 `concurrency` decides what a fresh trigger does to a run of the same rule that
 has not finished yet:
 
@@ -119,10 +135,11 @@ rejected, not whether its value would have done anything. An unrecognised
 `concurrency` is rejected the same way, naming the rule, the file and the
 three values it accepts.
 
-`durable` is not a recognised key at all, on either a rule or a step, and
-neither is any key not listed above. A file containing one fails to load: the
-error names the file and the offending key, and the rest of that file's rules
-do not load either. Other files in the extensions directory are unaffected.
+`durable` belongs to a step and nowhere else; on a rule it is not a
+recognised key, and neither is any key not listed above. A file containing one
+fails to load: the error names the file and the offending key, and the rest of
+that file's rules do not load either. Other files in the extensions directory
+are unaffected.
 
 ## A note on safety
 

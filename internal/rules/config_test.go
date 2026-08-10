@@ -110,8 +110,8 @@ cooldwn = "30s"
 }
 
 // TestLoadRejectsDurableKey guards the specific case named in the design
-// discussion: "durable" is not a recognised key on a rule or a step, and
-// writing it must not be silently ignored.
+// discussion: "durable" belongs to a step, so a rule carrying one is a typo
+// or a misunderstanding and must not be silently ignored.
 func TestLoadRejectsDurableKey(t *testing.T) {
 	dir := t.TempDir()
 	writeTOML(t, dir, "durable.toml", `

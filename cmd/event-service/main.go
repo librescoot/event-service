@@ -14,12 +14,36 @@ import (
 	"github.com/librescoot/event-service/internal/engine"
 	"github.com/librescoot/event-service/internal/rules"
 	"github.com/librescoot/event-service/internal/sched"
+	"github.com/librescoot/event-service/internal/seq"
 	"github.com/librescoot/event-service/internal/shadow"
 	"github.com/librescoot/eventbus"
 	ipc "github.com/librescoot/redis-ipc"
 )
 
 var version = "dev"
+
+// pendingHash gives the pending store the three hash operations it asks for.
+// The client has no HDel of its own, so that one goes through the raw command
+// interface.
+type pendingHash struct{ c *ipc.Client }
+
+func (h pendingHash) HSet(key, field string, value any) error {
+	return h.c.HSet(key, field, value)
+}
+
+func (h pendingHash) HGetAll(key string) (map[string]string, error) {
+	return h.c.HGetAll(key)
+}
+
+func (h pendingHash) HDel(key string, fields ...string) error {
+	args := make([]any, 0, len(fields)+1)
+	args = append(args, key)
+	for _, f := range fields {
+		args = append(args, f)
+	}
+	_, err := h.c.Do("HDEL", args...)
+	return err
+}
 
 func main() {
 	var (
@@ -28,6 +52,7 @@ func main() {
 		rulesDir  = flag.String("rules-dir", "/data/extensions", "directory of rule TOML files")
 		workers   = flag.Int("workers", 2, "action worker count")
 		queue     = flag.Int("queue", 256, "action queue depth")
+		replayWin = flag.Duration("replay-window", 5*time.Minute, "how far past due a recorded step may be and still run at start")
 	)
 	flag.Parse()
 
@@ -84,7 +109,9 @@ func main() {
 	pool.Start()
 	defer pool.Stop()
 
-	en, buildErrs := engine.New(compiled, pool, sch, client, log.Default())
+	store := seq.NewPendingStore(pendingHash{c: client}, log.Default())
+
+	en, buildErrs := engine.New(compiled, pool, sch, store, client, log.Default())
 	for _, err := range buildErrs {
 		log.Printf("rules: %v", err)
 	}
@@ -93,6 +120,12 @@ func main() {
 	defer en.Stop()
 
 	log.Printf("%d rules live from %s", en.RuleCount(), *rulesDir)
+
+	// Before the subscription, never after: a step picked up here must not
+	// race a live event re-firing the same rule.
+	if n := en.Replay(*replayWin); n > 0 {
+		log.Printf("rules: resumed %d pending step(s) from before the restart", n)
+	}
 
 	if en.RuleCount() > 0 {
 		patterns := en.Patterns()

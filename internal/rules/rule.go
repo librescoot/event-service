@@ -64,10 +64,13 @@ type Repeat struct {
 // arrived. After, when greater than zero, delays the step: it is checked
 // against the clock, not against When, so a step can wait and still carry
 // its own condition.
+// Durable, which only a step with After can be, records the step's pending
+// fire so a service restart during the wait does not lose it.
 type Step struct {
-	Config StepConfig
-	When   *vm.Program
-	After  time.Duration
+	Config  StepConfig
+	When    *vm.Program
+	After   time.Duration
+	Durable bool
 }
 
 // Compile turns parsed config into runnable rules. Errors are per-rule, so one
@@ -189,7 +192,22 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 		if after < 0 {
 			return nil, fmt.Errorf("step %d: after must not be negative", i)
 		}
-		s := Step{Config: sc, After: after}
+		// A step that waits is recorded by default, because the case that
+		// motivates recording at all, "turn it on, turn it off thirty seconds
+		// later", is written without thinking about restarts. An author who
+		// does not want the tail replayed writes durable = false. On a step
+		// with no after there is no wait to survive, so the key has nothing to
+		// mean: rejecting it beats accepting a no-op the author believes is
+		// doing something.
+		durable := after > 0
+		if sc.Durable != nil {
+			if after <= 0 {
+				return nil, fmt.Errorf("step %d: durable needs after; a step that does not wait has nothing to replay", i)
+			}
+			durable = *sc.Durable
+		}
+
+		s := Step{Config: sc, After: after, Durable: durable}
 		if sc.When != "" {
 			p, err := compileWhen(sc.When)
 			if err != nil {
