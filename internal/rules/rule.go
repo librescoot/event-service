@@ -22,7 +22,6 @@ type Rule struct {
 	Source   string
 	On       []string
 	Cooldown time.Duration
-	Debounce time.Duration
 	Step     StepConfig
 
 	program *vm.Program
@@ -66,11 +65,18 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 	if c.Concurrency != "" {
 		return nil, fmt.Errorf("concurrency is not supported yet")
 	}
-	if len(c.CancelOn) > 0 {
+	// Presence, not truthiness: cancel-on = [] and repeat = {} both decode to
+	// a non-nil, zero-length value, distinguishable from an omitted key by
+	// nil-ness alone. A rule author who wrote either meant to use the
+	// feature and must see the same rejection as the non-empty form.
+	if c.CancelOn != nil {
 		return nil, fmt.Errorf("cancel-on is not supported yet")
 	}
-	if len(c.Repeat) > 0 {
+	if c.Repeat != nil {
 		return nil, fmt.Errorf("repeat is not supported yet")
+	}
+	if c.Debounce != nil {
+		return nil, fmt.Errorf("debounce is not supported yet")
 	}
 
 	step := c.Steps[0]
@@ -92,9 +98,6 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 	var err error
 	if r.Cooldown, err = parseDuration(c.Cooldown); err != nil {
 		return nil, fmt.Errorf("cooldown: %w", err)
-	}
-	if r.Debounce, err = parseDuration(c.Debounce); err != nil {
-		return nil, fmt.Errorf("debounce: %w", err)
 	}
 
 	if c.When != "" {

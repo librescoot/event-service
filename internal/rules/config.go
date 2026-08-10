@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -23,12 +24,18 @@ type RuleConfig struct {
 	On          []string       `toml:"on"`
 	When        string         `toml:"when"`
 	Cooldown    string         `toml:"cooldown"`
-	Debounce    string         `toml:"debounce"`
 	Enabled     *bool          `toml:"enabled"`
 	Steps       []StepConfig   `toml:"step"`
 	Concurrency string         `toml:"concurrency"`
 	CancelOn    []string       `toml:"cancel-on"`
 	Repeat      map[string]any `toml:"repeat"`
+
+	// Debounce is a pointer, unlike the other rejected-by-name fields, so
+	// Compile can tell "debounce was never written" from "debounce was
+	// written as an empty duration like 0s": both parse to the same zero
+	// time.Duration, but only the former is silence rather than a rule
+	// author believing the feature works.
+	Debounce *string `toml:"debounce"`
 
 	// Source names the file this rule came from, so an error message can tell
 	// the user which of their files to go and fix.
@@ -51,9 +58,11 @@ type StepConfig struct {
 	Timeout string `toml:"timeout"`
 }
 
-// Load reads every *.toml in dir. A file that fails to parse yields an error
-// in the returned slice and is skipped; the rest still load, because losing
-// every rule over one typo in one file is worse than running a subset.
+// Load reads every *.toml in dir. A file that fails to parse, or that
+// contains a key nothing in RuleConfig or StepConfig recognises, yields an
+// error in the returned slice and is skipped; the rest still load, because
+// losing every rule over one typo in one file is worse than running a
+// subset.
 //
 // A missing directory is not an error: no extensions installed is the normal
 // state of a scooter.
@@ -85,10 +94,30 @@ func Load(dir string) (*Config, []error) {
 	for _, name := range names {
 		path := filepath.Join(dir, name)
 		var fileCfg Config
-		if _, err := toml.DecodeFile(path, &fileCfg); err != nil {
+		md, err := toml.DecodeFile(path, &fileCfg)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", name, err))
 			continue
 		}
+
+		// toml.DecodeFile does not reject unknown keys on its own: a typo'd
+		// field name or a made-up one just fails to land anywhere and is
+		// dropped without a trace. md.Undecoded() is the list of keys the
+		// file mentioned that the struct never claimed, which is exactly
+		// what a typo or an unsupported feature written in good faith looks
+		// like. Reject the whole file rather than trying to salvage the
+		// rules in it, the same way a genuinely malformed file is rejected
+		// above, so the user is not left thinking a key took effect when it
+		// was silently ignored.
+		if undecoded := md.Undecoded(); len(undecoded) > 0 {
+			keys := make([]string, len(undecoded))
+			for i, k := range undecoded {
+				keys[i] = k.String()
+			}
+			errs = append(errs, fmt.Errorf("%s: unknown key(s): %s", name, strings.Join(keys, ", ")))
+			continue
+		}
+
 		for i := range fileCfg.Rules {
 			fileCfg.Rules[i].Source = name
 		}

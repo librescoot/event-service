@@ -3,6 +3,7 @@ package rules
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +72,65 @@ func TestLoadReportsBadFileButKeepsGoodOnes(t *testing.T) {
 	}
 	if len(cfg.Rules) != 1 || cfg.Rules[0].Name != "ok" {
 		t.Fatalf("good rule was lost: %+v", cfg.Rules)
+	}
+}
+
+// TestLoadRejectsUnknownKeys guards finding 2: toml.DecodeFile does not
+// reject unknown keys on its own, so a typo like "cooldwn" instead of
+// "cooldown" would otherwise load silently with no cooldown applied. The
+// good file must still load, the same as any other single-file error.
+func TestLoadRejectsUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	writeTOML(t, dir, "good.toml", "[[rule]]\nname=\"ok\"\non=[\"x.y\"]\n[[rule.step]]\ndo=\"redis\"\nlist=\"l\"\npush=\"p\"\n")
+	writeTOML(t, dir, "typo.toml", `
+[[rule]]
+name = "typo"
+on   = ["x.y"]
+cooldwn = "30s"
+  [[rule.step]]
+  do = "redis"
+  list = "l"
+  push = "p"
+`)
+
+	cfg, errs := Load(dir)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	msg := errs[0].Error()
+	if !strings.Contains(msg, "typo.toml") {
+		t.Errorf("error should name the file, got %q", msg)
+	}
+	if !strings.Contains(msg, "cooldwn") {
+		t.Errorf("error should name the offending key, got %q", msg)
+	}
+	if len(cfg.Rules) != 1 || cfg.Rules[0].Name != "ok" {
+		t.Fatalf("good rule was lost: %+v", cfg.Rules)
+	}
+}
+
+// TestLoadRejectsDurableKey guards the specific case named in the design
+// discussion: "durable" is not a recognised key on a rule or a step, and
+// writing it must not be silently ignored.
+func TestLoadRejectsDurableKey(t *testing.T) {
+	dir := t.TempDir()
+	writeTOML(t, dir, "durable.toml", `
+[[rule]]
+name = "r"
+on   = ["x.y"]
+durable = true
+  [[rule.step]]
+  do = "redis"
+  list = "l"
+  push = "p"
+`)
+
+	_, errs := Load(dir)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	if !strings.Contains(errs[0].Error(), "durable") {
+		t.Errorf("error should name the offending key, got %v", errs[0])
 	}
 }
 

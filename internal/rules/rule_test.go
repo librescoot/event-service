@@ -196,13 +196,10 @@ func TestCompileDefaultsToEnabled(t *testing.T) {
 
 func TestCompileParsesDurations(t *testing.T) {
 	r := mustCompileOne(t, RuleConfig{
-		Name: "r", On: []string{"x.y"}, Cooldown: "60s", Debounce: "500ms", Steps: []StepConfig{redisStep()},
+		Name: "r", On: []string{"x.y"}, Cooldown: "60s", Steps: []StepConfig{redisStep()},
 	}, noState)
 	if r.Cooldown.Seconds() != 60 {
 		t.Errorf("cooldown = %v, want 60s", r.Cooldown)
-	}
-	if r.Debounce.Milliseconds() != 500 {
-		t.Errorf("debounce = %v, want 500ms", r.Debounce)
 	}
 }
 
@@ -233,6 +230,62 @@ func TestCompileRejectsCancelOn(t *testing.T) {
 func TestCompileRejectsRepeat(t *testing.T) {
 	_, errs := Compile([]RuleConfig{{
 		Name: "r", On: []string{"x.y"}, Repeat: map[string]any{"every": "5s"}, Steps: []StepConfig{redisStep()},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1", len(errs))
+	}
+	if !strings.Contains(errs[0].Error(), "not supported yet") {
+		t.Errorf("error should name the limitation, got %v", errs[0])
+	}
+}
+
+func TestCompileRejectsDebounce(t *testing.T) {
+	d := "500ms"
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", On: []string{"x.y"}, Debounce: &d, Steps: []StepConfig{redisStep()},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1", len(errs))
+	}
+	if !strings.Contains(errs[0].Error(), "not supported yet") {
+		t.Errorf("error should name the limitation, got %v", errs[0])
+	}
+}
+
+// The three tests below guard finding 8: an empty spelling of an unsupported
+// feature (an empty list, an empty table, a zero duration) must be rejected
+// exactly like its non-empty form. All three parse to the same Go zero value
+// as an omitted key, so a check that looks at truthiness instead of presence
+// would let them through unnoticed.
+
+func TestCompileRejectsEmptyCancelOn(t *testing.T) {
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", On: []string{"x.y"}, CancelOn: []string{}, Steps: []StepConfig{redisStep()},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1", len(errs))
+	}
+	if !strings.Contains(errs[0].Error(), "not supported yet") {
+		t.Errorf("error should name the limitation, got %v", errs[0])
+	}
+}
+
+func TestCompileRejectsEmptyRepeat(t *testing.T) {
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", On: []string{"x.y"}, Repeat: map[string]any{}, Steps: []StepConfig{redisStep()},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1", len(errs))
+	}
+	if !strings.Contains(errs[0].Error(), "not supported yet") {
+		t.Errorf("error should name the limitation, got %v", errs[0])
+	}
+}
+
+func TestCompileRejectsZeroDebounce(t *testing.T) {
+	d := "0s"
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", On: []string{"x.y"}, Debounce: &d, Steps: []StepConfig{redisStep()},
 	}}, noState)
 	if len(errs) != 1 {
 		t.Fatalf("got %d errors, want 1", len(errs))
