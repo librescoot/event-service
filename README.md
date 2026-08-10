@@ -52,13 +52,15 @@ startup, or that belongs to a hash nothing watches, reads back as `""`,
 indistinguishable from a genuinely empty value. A rule with no `when` fires on
 every event matching `on`.
 
-`cooldown` (a duration, e.g. `"30s"`) suppresses repeat firing of a rule
-within the given window after it last fired.
-
 Supported `do` kinds for `[[rule.step]]`:
 
 - `redis`: push a value onto a list with `list` and `push`.
-- `exec`: run a command with `command` and an optional `timeout`.
+- `exec`: run a command with `command` and an optional `timeout`, default
+  `10s`. The event is on stdin as JSON, plus `LS_TOPIC`, `LS_SRC`, `LS_FROM`,
+  `LS_TO`, `LS_ID` and one `LS_DATA_<KEY>` per scalar `data` field, so a short
+  shell script needs no JSON parser.
+
+### Step sequences
 
 A rule can have several `[[rule.step]]` blocks. They run in order, and a step
 starts only once the one before it has finished. A step that fails ends the
@@ -74,6 +76,31 @@ A step can also carry `after` (a duration), which runs it that long after the
 step before it finished. A step waiting out its delay holds no worker and no
 thread: it sits on a timer, so a rule can say "and thirty seconds later, turn
 it off" without occupying anything for thirty seconds.
+
+Here is the rule this feature was built for, exactly as it loads:
+
+    [[rule]]
+    name        = "hazards-on-alarm"
+    on          = ["alarm.triggered"]
+    concurrency = "restart"
+    cancel-on   = ["alarm.disarmed"]
+
+      [[rule.step]]
+      do   = "redis"
+      list = "scooter:blinker"
+      push = "both"
+
+      [[rule.step]]
+      after = "30s"
+      do    = "redis"
+      list  = "scooter:blinker"
+      push  = "off"
+
+On the alarm, the hazards go on straight away, and thirty seconds later the
+second step turns them off, unless something disarms the rule first (see
+`cancel-on` below).
+
+### Durability
 
 A step with `after` is also `durable` unless it says otherwise. The waiting
 step is written to the `extensions:pending` hash when it is scheduled and
@@ -98,6 +125,8 @@ Write `durable = false` on the step to opt out, and note that nothing is
 recorded for a `repeat` gap or for a trigger sitting in a `queue` backlog:
 neither has acted on the vehicle yet. `durable` on a step without `after`
 fails to load rather than doing nothing quietly.
+
+### Concurrency and cancellation
 
 `concurrency` decides what a fresh trigger does to a run of the same rule that
 has not finished yet:
@@ -124,30 +153,92 @@ still waiting its turn in the pool's queue. A `redis` push or an `exec` command
 already accepted will complete. What cancelling guarantees is that nothing
 after that step runs.
 
+### Repeat
+
+`repeat = { count = 3, every = "700ms" }` at rule level runs the whole step
+sequence again once it finishes, `count` times in total, waiting `every`
+between one pass finishing and the next starting. With no `repeat` key a rule
+runs one pass, which is also what `count = 1` means. `every` is only checked,
+and only has to be positive, once `count` is greater than 1, since a single
+pass has nothing to wait between. Writing the key at all commits to the
+feature: `repeat = {}` decodes to `count = 0`, rejected the same as any other
+bad count rather than read as "no repeat".
+
+The gap between passes is not durable; only a step's own `after` is. A
+restart during the gap simply ends the run there, on the pass it had reached.
+
+### Cooldown and debounce
+
+`cooldown` (a duration, e.g. `"30s"`) suppresses repeat firing of a rule
+within the given window after it last fired. This is a leading edge: the
+first event of a burst fires immediately, and everything else inside the
+window is ignored outright.
+
+`debounce` (a duration) is the opposite, a trailing edge: nothing dispatches
+while matching events keep arriving. Each one restarts the quiet window, and
+once the window elapses without a new match the rule fires exactly once,
+carrying the most recent event seen, not the one that opened the window. A
+`debounce` must be positive if the key is written at all; an omitted key means
+no debounce, same as `cooldown`.
+
+The two compose rather than conflict. With both set, `cooldown` is checked
+against the debounced dispatch itself, not against each event that only
+restarted the window, so a burst that never goes quiet long enough to satisfy
+`debounce` never reaches `cooldown` at all.
+
+### Naming and errors
+
 A rule's `name` must be unique across every file in the directory. It is the
 handle a rule's runs are grouped under, so two rules sharing one would share a
 concurrency policy, a cancel-on list and a queue, and either could cancel the
 other's runs on a topic it never mentions. The second definition fails to load
 with an error naming both files; the first still loads, as does everything
-else. A disabled rule holds no name, so keeping the old copy around with
-`enabled = false` while a variant is tried works as expected.
+else. A disabled rule (`enabled = false`) claims no name, and neither does a
+rule that fails to compile, so keeping an old copy around while a variant is
+tried, or fixing a broken rule under the name a working one already took,
+works as expected.
 
-Not supported yet: `repeat`, `debounce`, and the `can`, `lua`, and `http` step
-kinds. A rule using any of these fails to load rather than silently doing
-nothing. The error always names the rule and the file; where the offending key
-belongs to a step (`after`, and any problem with a step's `do` or `when`) it
-also names the step index. `repeat` and `debounce` sit on the rule itself, so
-their errors have no step to name. This includes writing the empty form of a
-feature (`repeat = {}`, `debounce = "0s"`): the key being present is what is
-rejected, not whether its value would have done anything. An unrecognised
-`concurrency` is rejected the same way, naming the rule, the file and the
-three values it accepts.
+Not supported yet: the `can`, `lua`, and `http` step kinds. A rule using any
+of these fails to load rather than silently doing nothing. The error always
+names the rule and the file; where the offending key belongs to a step
+(`do`, `after`, or a step's `when`) it also names the step index. `repeat`,
+`debounce` and `concurrency` sit on the rule itself, so their errors have no
+step to name. An unrecognised `concurrency` is rejected the same way the step
+kinds are, naming the rule, the file and the three values it accepts.
 
 `durable` belongs to a step and nowhere else; on a rule it is not a
 recognised key, and neither is any key not listed above. A file containing one
 fails to load: the error names the file and the offending key, and the rest of
 that file's rules do not load either. Other files in the extensions directory
 are unaffected.
+
+### Keys, at a glance
+
+Rule level:
+
+| Key | Default |
+|---|---|
+| `name` | required, unique across every file |
+| `on` | required |
+| `when` | none: fires on every event `on` matches |
+| `concurrency` | `restart` |
+| `cancel-on` | none |
+| `cooldown` | none |
+| `debounce` | none; must be positive if set |
+| `repeat` | none (one pass); `count` at least 1, `every` positive and required once `count` > 1 |
+| `enabled` | `true` |
+
+Step level:
+
+| Key | Default |
+|---|---|
+| `do` | required: `redis` or `exec` |
+| `when` | none: step always runs |
+| `after` | none: step runs as soon as it is reached |
+| `durable` | `true` if `after` is set; the key is a load error on a step with no `after` |
+| `list`, `push` | required for `do = "redis"` |
+| `command` | required for `do = "exec"` |
+| `timeout` | `10s`, for `do = "exec"` |
 
 ## A note on safety
 
@@ -161,3 +252,14 @@ the same position `EVENT-SERVICE-DESIGN.md` takes on the `can` step kind: the
 extension subsystem is a power-user feature, and it is deliberately not
 event-service's job to second-guess what a rule tells the vehicle to do.
 Write rules with that in mind.
+
+Durability extends the same stance across a restart. A step with `after`
+survives the service going down and comes back to finish on the next start,
+so a rule nobody retriggered this session, sitting on a wait from before the
+restart, can still `LPUSH` onto a command queue once the service is back up,
+without any event happening in between that the rider watching the vehicle
+now would connect to it. That is deliberate: durability exists so a sequence
+that already told the vehicle to do half of something finishes the other
+half, and there is no separate check asking whether it still should. Do not
+write an `after` step onto a command queue you would not want fired by
+something that happened before the current rider ever saw the vehicle.
