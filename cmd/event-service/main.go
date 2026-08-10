@@ -13,6 +13,7 @@ import (
 	"github.com/librescoot/event-service/internal/adapter"
 	"github.com/librescoot/event-service/internal/engine"
 	"github.com/librescoot/event-service/internal/rules"
+	"github.com/librescoot/event-service/internal/sched"
 	"github.com/librescoot/event-service/internal/shadow"
 	"github.com/librescoot/eventbus"
 	ipc "github.com/librescoot/redis-ipc"
@@ -76,11 +77,14 @@ func main() {
 		log.Printf("rules: %v", err)
 	}
 
+	sch := sched.New()
+	defer sch.Stop()
+
 	pool := action.NewPool(*workers, *queue, log.Default())
 	pool.Start()
 	defer pool.Stop()
 
-	en, buildErrs := engine.New(compiled, pool, client, log.Default())
+	en, buildErrs := engine.New(compiled, pool, sch, client, log.Default())
 	for _, err := range buildErrs {
 		log.Printf("rules: %v", err)
 	}

@@ -31,10 +31,13 @@ type Rule struct {
 // Step is one step of a rule. Config holds the fields the action is built
 // from; When, when not nil, is a condition checked immediately before the
 // step runs, as opposed to the rule-level condition checked when the event
-// arrived.
+// arrived. After, when greater than zero, delays the step: it is checked
+// against the clock, not against When, so a step can wait and still carry
+// its own condition.
 type Step struct {
 	Config StepConfig
 	When   *vm.Program
+	After  time.Duration
 }
 
 // Compile turns parsed config into runnable rules. Errors are per-rule, so one
@@ -109,10 +112,14 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 	// The index goes into every step error: with a rule of five steps, an
 	// error that names only the rule leaves the user reading all five.
 	for i, sc := range c.Steps {
-		if sc.After != "" {
-			return nil, fmt.Errorf("step %d: after is not supported yet", i)
+		after, err := parseDuration(sc.After)
+		if err != nil {
+			return nil, fmt.Errorf("step %d: after: %w", i, err)
 		}
-		s := Step{Config: sc}
+		if after < 0 {
+			return nil, fmt.Errorf("step %d: after must not be negative", i)
+		}
+		s := Step{Config: sc, After: after}
 		if sc.When != "" {
 			p, err := compileWhen(sc.When)
 			if err != nil {

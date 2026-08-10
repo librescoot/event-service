@@ -6,6 +6,7 @@ import (
 	"github.com/librescoot/eventbus"
 
 	"github.com/librescoot/event-service/internal/action"
+	"github.com/librescoot/event-service/internal/sched"
 )
 
 // Logger is the small slice of logging this package needs.
@@ -14,22 +15,27 @@ type Logger interface {
 }
 
 // run is one walk over a sequence's steps. step is the index of the next step
-// to claim, and ended marks a run that must not move any further.
+// to claim, and ended marks a run that must not move any further. cancelTail
+// holds the scheduler cancel for a step currently parked on a timer; it is
+// nil whenever the run is not waiting out an after.
 //
-// Both fields are guarded by the Runner's mutex: a run starts on the bus
+// All three fields are guarded by the Runner's mutex: a run starts on the bus
 // subscriber goroutine and then moves forward on whichever pool worker
-// finished the previous step.
+// finished the previous step, or on the scheduler's own goroutine once a
+// parked step's timer fires.
 type run struct {
-	seq   *Sequence
-	event eventbus.Event
-	step  int
-	ended bool
+	seq        *Sequence
+	event      eventbus.Event
+	step       int
+	ended      bool
+	cancelTail func() bool
 }
 
 // Runner walks sequences. In-flight runs are registered under their rule
 // name, which is the handle anything acting on a whole rule needs.
 type Runner struct {
 	pool *action.Pool
+	sch  *sched.Scheduler
 	log  Logger
 
 	mu      sync.Mutex
@@ -37,10 +43,12 @@ type Runner struct {
 	stopped bool
 }
 
-// NewRunner returns a Runner that submits steps to pool.
-func NewRunner(pool *action.Pool, log Logger) *Runner {
+// NewRunner returns a Runner that submits steps to pool and parks a step's
+// after delay on sch.
+func NewRunner(pool *action.Pool, sch *sched.Scheduler, log Logger) *Runner {
 	return &Runner{
 		pool: pool,
+		sch:  sch,
 		log:  log,
 		runs: make(map[string][]*run),
 	}
@@ -68,9 +76,11 @@ func (rn *Runner) Fire(s *Sequence, e eventbus.Event) {
 	rn.advance(r)
 }
 
-// advance submits the step the run is sitting on, or ends the run. It is the
-// single place a run moves forward: Fire calls it to start one, and every
-// step's completion callback calls it for the step after.
+// advance claims the step the run is sitting on, or ends the run if none are
+// left. It is the single place a run's step index moves forward: Fire calls
+// it to start a run, a step's completion callback calls it for the step
+// after, and a parked step's timer fire reaches it indirectly, through
+// runStep rather than a second call to advance, once its delay has elapsed.
 func (rn *Runner) advance(r *run) {
 	rn.mu.Lock()
 	if r.ended || rn.stopped {
@@ -86,12 +96,55 @@ func (rn *Runner) advance(r *run) {
 	r.step = idx + 1
 	rn.mu.Unlock()
 
-	name := r.seq.Rule.Name
 	if idx >= len(r.seq.Steps) {
 		rn.end(r)
 		return
 	}
 	step := r.seq.Steps[idx]
+
+	if step.After > 0 {
+		rn.deferStep(r, idx, step)
+		return
+	}
+
+	rn.runStep(r, idx, step)
+}
+
+// deferStep parks step on the scheduler and returns without submitting
+// anything, so the run holds no worker and no goroutine of its own while it
+// waits out the delay. The step's when, if it has one, is deliberately left
+// unevaluated here: runStep checks it once the timer fires, against whatever
+// the shadow store holds at that moment, not against what it held when the
+// wait began.
+func (rn *Runner) deferStep(r *run, idx int, step CompiledStep) {
+	rn.mu.Lock()
+	if r.ended || rn.stopped {
+		rn.mu.Unlock()
+		return
+	}
+	// The cancel is stored under the same lock that a concurrent end or Stop
+	// needs, so either this line has not run yet, in which case the run is
+	// already ended and the fire callback below finds that and stops there,
+	// or it has, in which case end or Stop can reach it and cancel the timer
+	// before it fires.
+	r.cancelTail = rn.sch.At(step.After, func() {
+		rn.mu.Lock()
+		if r.ended || rn.stopped {
+			rn.mu.Unlock()
+			return
+		}
+		r.cancelTail = nil
+		rn.mu.Unlock()
+		rn.runStep(r, idx, step)
+	})
+	rn.mu.Unlock()
+}
+
+// runStep evaluates a step's when, if it has one, and submits it. advance
+// calls it directly for a step with no delay; deferStep's timer callback
+// calls it once a delayed step's wait is over.
+func (rn *Runner) runStep(r *run, idx int, step CompiledStep) {
+	name := r.seq.Rule.Name
 
 	if step.When != nil {
 		ok, err := r.seq.Rule.EvalWhen(step.When, r.event)
@@ -142,7 +195,10 @@ func (rn *Runner) advance(r *run) {
 }
 
 // end takes the run out of the registry. Marking it ended first means a
-// completion arriving afterwards finds nothing left to advance.
+// completion arriving afterwards finds nothing left to advance. A pending
+// tail, if there is one, is cancelled here too: a run that ends early,
+// whether from a failed step, a false when, or a refused submit, must not
+// leave a timer behind to fire into a run nothing is tracking any more.
 func (rn *Runner) end(r *run) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -150,6 +206,10 @@ func (rn *Runner) end(r *run) {
 		return
 	}
 	r.ended = true
+	if r.cancelTail != nil {
+		r.cancelTail()
+		r.cancelTail = nil
+	}
 
 	name := r.seq.Rule.Name
 	list := rn.runs[name]
@@ -164,7 +224,8 @@ func (rn *Runner) end(r *run) {
 	}
 }
 
-// Active is how many runs are part-way through their steps.
+// Active is how many runs are part-way through their steps, including a run
+// currently parked on a timer waiting out an after.
 func (rn *Runner) Active() int {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -176,7 +237,10 @@ func (rn *Runner) Active() int {
 	return n
 }
 
-// Stop refuses new runs and abandons the in-flight ones. A step already on a
+// Stop refuses new runs and abandons the in-flight ones, cancelling any
+// pending tail along the way: a run parked on a timer is still active, and
+// letting that timer fire after the runner considers itself stopped would
+// submit a step into a pool that may already be gone. A step already on a
 // worker still runs to the end; its callback then finds the run ended and
 // stops there rather than queueing more work into a pool that is going away.
 func (rn *Runner) Stop() {
@@ -187,6 +251,10 @@ func (rn *Runner) Stop() {
 	for _, list := range rn.runs {
 		for _, r := range list {
 			r.ended = true
+			if r.cancelTail != nil {
+				r.cancelTail()
+				r.cancelTail = nil
+			}
 		}
 	}
 	rn.runs = make(map[string][]*run)

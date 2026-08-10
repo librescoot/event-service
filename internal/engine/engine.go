@@ -9,6 +9,7 @@ import (
 
 	"github.com/librescoot/event-service/internal/action"
 	"github.com/librescoot/event-service/internal/rules"
+	"github.com/librescoot/event-service/internal/sched"
 	"github.com/librescoot/event-service/internal/seq"
 	"github.com/librescoot/eventbus"
 )
@@ -35,9 +36,10 @@ type Engine struct {
 
 // New builds a sequence for every rule. A rule whose steps cannot be built is
 // reported and dropped; the others still run, for the same reason a bad file
-// does not stop the good ones loading.
-func New(rs []*rules.Rule, pool *action.Pool, c action.Pusher, log Logger) (*Engine, []error) {
-	en := &Engine{runner: seq.NewRunner(pool, log), log: log}
+// does not stop the good ones loading. sch parks the tail of any step that
+// carries an after delay.
+func New(rs []*rules.Rule, pool *action.Pool, sch *sched.Scheduler, c action.Pusher, log Logger) (*Engine, []error) {
+	en := &Engine{runner: seq.NewRunner(pool, sch, log), log: log}
 	var errs []error
 
 	for _, r := range rs {

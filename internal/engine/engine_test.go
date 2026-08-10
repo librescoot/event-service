@@ -9,6 +9,7 @@ import (
 
 	"github.com/librescoot/event-service/internal/action"
 	"github.com/librescoot/event-service/internal/rules"
+	"github.com/librescoot/event-service/internal/sched"
 	"github.com/librescoot/eventbus"
 )
 
@@ -32,6 +33,13 @@ func (p *countingPusher) count() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.n
+}
+
+func testSched(t *testing.T) *sched.Scheduler {
+	t.Helper()
+	s := sched.New()
+	t.Cleanup(s.Stop)
+	return s
 }
 
 func compileRules(t *testing.T, cfgs ...rules.RuleConfig) []*rules.Rule {
@@ -65,7 +73,7 @@ func TestHandleDispatchesMatchingRule(t *testing.T) {
 	defer pool.Stop()
 
 	rs := compileRules(t, rules.RuleConfig{Name: "r", On: []string{"alarm.triggered"}, Steps: []rules.StepConfig{horn()}})
-	en, errs := New(rs, pool, p, nopLog{})
+	en, errs := New(rs, pool, testSched(t), p, nopLog{})
 	if len(errs) != 0 {
 		t.Fatalf("New: %v", errs)
 	}
@@ -81,7 +89,7 @@ func TestHandleIgnoresNonMatchingTopic(t *testing.T) {
 	defer pool.Stop()
 
 	rs := compileRules(t, rules.RuleConfig{Name: "r", On: []string{"alarm.triggered"}, Steps: []rules.StepConfig{horn()}})
-	en, _ := New(rs, pool, p, nopLog{})
+	en, _ := New(rs, pool, testSched(t), p, nopLog{})
 
 	en.Handle(eventbus.Event{Topic: "vehicle.unlocked"})
 	time.Sleep(100 * time.Millisecond)
@@ -99,7 +107,7 @@ func TestCooldownSuppressesRepeatFires(t *testing.T) {
 	rs := compileRules(t, rules.RuleConfig{
 		Name: "r", On: []string{"motion.detected"}, Cooldown: "10s", Steps: []rules.StepConfig{horn()},
 	})
-	en, _ := New(rs, pool, p, nopLog{})
+	en, _ := New(rs, pool, testSched(t), p, nopLog{})
 
 	for i := 0; i < 5; i++ {
 		en.Handle(eventbus.Event{Topic: "motion.detected"})
@@ -124,7 +132,7 @@ func TestCooldownExpiresAndFiresAgain(t *testing.T) {
 	rs := compileRules(t, rules.RuleConfig{
 		Name: "r", On: []string{"motion.detected"}, Cooldown: "50ms", Steps: []rules.StepConfig{horn()},
 	})
-	en, _ := New(rs, pool, p, nopLog{})
+	en, _ := New(rs, pool, testSched(t), p, nopLog{})
 
 	en.Handle(eventbus.Event{Topic: "motion.detected"})
 	waitFor(t, func() bool { return p.count() >= 1 })
@@ -175,7 +183,7 @@ func TestHandleRunsEveryStepOfAMultiStepRule(t *testing.T) {
 			{Do: "redis", List: "scooter:horn", Push: "off"},
 		},
 	})
-	en, errs := New(rs, pool, p, nopLog{})
+	en, errs := New(rs, pool, testSched(t), p, nopLog{})
 	if len(errs) != 0 {
 		t.Fatalf("New: %v", errs)
 	}
@@ -198,7 +206,7 @@ func TestPatternsCoverEveryRuleTopic(t *testing.T) {
 		rules.RuleConfig{Name: "a", On: []string{"alarm.triggered"}, Steps: []rules.StepConfig{horn()}},
 		rules.RuleConfig{Name: "b", On: []string{"battery.*"}, Steps: []rules.StepConfig{horn()}},
 	)
-	en, _ := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
+	en, _ := New(rs, action.NewPool(1, 1, nopLog{}), testSched(t), &countingPusher{}, nopLog{})
 
 	got := en.Patterns()
 	want := map[string]bool{"ev:alarm.triggered": false, "ev:battery.*": false}
@@ -220,7 +228,7 @@ func TestNewReportsUnbuildableRuleWithoutLosingTheRest(t *testing.T) {
 		rules.RuleConfig{Name: "good", On: []string{"x.y"}, Steps: []rules.StepConfig{horn()}},
 		rules.RuleConfig{Name: "bad", On: []string{"x.y"}, Steps: []rules.StepConfig{{Do: "telepathy"}}},
 	)
-	en, errs := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
+	en, errs := New(rs, action.NewPool(1, 1, nopLog{}), testSched(t), &countingPusher{}, nopLog{})
 	if len(errs) != 1 {
 		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
 	}
@@ -239,7 +247,7 @@ func TestNewErrorNamesRuleAndFile(t *testing.T) {
 	rs := compileRules(t, rules.RuleConfig{
 		Name: "bad", Source: "horn.toml", On: []string{"x.y"}, Steps: []rules.StepConfig{{Do: "telepathy"}},
 	})
-	_, errs := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
+	_, errs := New(rs, action.NewPool(1, 1, nopLog{}), testSched(t), &countingPusher{}, nopLog{})
 	if len(errs) != 1 {
 		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
 	}
@@ -261,7 +269,7 @@ func TestNewErrorNamesRuleFileAndStepTogether(t *testing.T) {
 		Name: "hazards", Source: "hazards.toml", On: []string{"x.y"},
 		Steps: []rules.StepConfig{horn(), {Do: "telepathy"}},
 	})
-	_, errs := New(rs, action.NewPool(1, 1, nopLog{}), &countingPusher{}, nopLog{})
+	_, errs := New(rs, action.NewPool(1, 1, nopLog{}), testSched(t), &countingPusher{}, nopLog{})
 	if len(errs) != 1 {
 		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
 	}

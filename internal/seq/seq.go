@@ -4,11 +4,15 @@
 // once the step before it has finished. Nothing here owns a goroutine. Step
 // N+1 is submitted from step N's completion callback, which runs on the pool
 // worker that just finished step N, so a scooter with a hundred half-finished
-// sequences pays for a hundred small structs and nothing else.
+// sequences pays for a hundred small structs and nothing else. A step with an
+// after delay is the one exception to "submitted right away": it parks on a
+// scheduler timer between the step before it finishing and its own submit,
+// holding no worker and no goroutine of its own while it waits.
 package seq
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/expr-lang/expr/vm"
 
@@ -23,10 +27,13 @@ type Sequence struct {
 }
 
 // CompiledStep is one step ready to submit. When is nil for a step with no
-// condition of its own.
+// condition of its own. After is zero for a step that runs as soon as it is
+// reached; a step with After greater than zero parks on a timer for that
+// long before it is submitted.
 type CompiledStep struct {
 	Action action.Action
 	When   *vm.Program
+	After  time.Duration
 }
 
 // Build compiles every step of r. An error names the step index; the caller
@@ -45,7 +52,7 @@ func Build(r *rules.Rule, c action.Pusher) (*Sequence, error) {
 		if err != nil {
 			return nil, fmt.Errorf("step %d: %w", i, err)
 		}
-		s.Steps = append(s.Steps, CompiledStep{Action: a, When: step.When})
+		s.Steps = append(s.Steps, CompiledStep{Action: a, When: step.When, After: step.After})
 	}
 
 	return s, nil

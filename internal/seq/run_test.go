@@ -3,12 +3,14 @@ package seq
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/librescoot/event-service/internal/action"
 	"github.com/librescoot/event-service/internal/rules"
+	"github.com/librescoot/event-service/internal/sched"
 	"github.com/librescoot/event-service/internal/shadow"
 	"github.com/librescoot/eventbus"
 )
@@ -62,7 +64,7 @@ func seqWith(t *testing.T, r *rules.Rule, acts ...action.Action) *Sequence {
 	}
 	s := &Sequence{Rule: r, Steps: make([]CompiledStep, len(acts))}
 	for i, a := range acts {
-		s.Steps[i] = CompiledStep{Action: a, When: r.Steps[i].When}
+		s.Steps[i] = CompiledStep{Action: a, When: r.Steps[i].When, After: r.Steps[i].After}
 	}
 	return s
 }
@@ -73,6 +75,13 @@ func startedPool(t *testing.T, workers, queue int) *action.Pool {
 	p.Start()
 	t.Cleanup(p.Stop)
 	return p
+}
+
+func testSched(t *testing.T) *sched.Scheduler {
+	t.Helper()
+	s := sched.New()
+	t.Cleanup(s.Stop)
+	return s
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -106,7 +115,7 @@ func TestTwoStepsRunInOrder(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"), rec.step("three"))
 
-	rn := NewRunner(startedPool(t, 1, 8), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -123,7 +132,7 @@ func TestSecondStepDoesNotRunWhenFirstFails(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.failing("one", errors.New("boom")), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -144,7 +153,7 @@ func TestStepWhenFalseStopsTheRunWithoutError(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"), rec.step("three"))
 
-	rn := NewRunner(startedPool(t, 1, 8), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y", To: "parked"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -167,7 +176,7 @@ func TestStepWhenSeesTheTriggeringEvent(t *testing.T) {
 	}, nil)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
 	rn.Fire(s, eventbus.Event{
 		Topic: "battery.inserted", From: "absent", To: "present",
 		Data: map[string]any{"slot": 1},
@@ -193,7 +202,7 @@ func TestStepWhenCanReadStateFromTheShadowStore(t *testing.T) {
 	}, sh.Get)
 	s := seqWith(t, r, rec.step("one"), rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "motion.detected"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -225,7 +234,7 @@ func TestRunEndsWhenPoolRefusesAStep(t *testing.T) {
 	}}
 	s := seqWith(t, r, first, rec.step("two"))
 
-	rn := NewRunner(pool, nopLog{})
+	rn := NewRunner(pool, testSched(t), nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
@@ -250,7 +259,7 @@ func TestActiveCountsARunUntilItEnds(t *testing.T) {
 	}}
 	s := seqWith(t, r, blocking, rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	if n := rn.Active(); n != 1 {
@@ -276,7 +285,7 @@ func TestStopAbandonsRunsAndRefusesNewOnes(t *testing.T) {
 	}}
 	s := seqWith(t, r, blocking, rec.step("two"))
 
-	rn := NewRunner(startedPool(t, 1, 8), nopLog{})
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
 	rn.Fire(s, eventbus.Event{Topic: "x.y"})
 
 	rn.Stop()
@@ -290,5 +299,149 @@ func TestStopAbandonsRunsAndRefusesNewOnes(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got := rec.list(); len(got) != 0 {
 		t.Errorf("steps ran as %v after Stop, want none", got)
+	}
+}
+
+func TestStepWithAfterDoesNotRunImmediately(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "30ms"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
+	// Well short of the 30ms delay: a step with after must not be submitted
+	// the moment the step before it finishes.
+	time.Sleep(10 * time.Millisecond)
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v before the delay elapsed, want only one", got)
+	}
+}
+
+func TestStepWithAfterEventuallyRuns(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "20ms"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"one", "two"}) {
+		t.Errorf("steps ran as %v, want one, two; a delayed step must still run", got)
+	}
+}
+
+// TestStepWhenIsReEvaluatedAtFireTimeNotAtScheduleTime is the point of a
+// step-level condition on a deferred step. Step one flips alarm status the
+// moment it runs, well before the second step's 30ms delay is over, so a
+// when checked at schedule time would still see "armed" and a when checked
+// at fire time would see "disarmed". Only the latter reading agrees with
+// this test's expectation that step two does not run.
+func TestStepWhenIsReEvaluatedAtFireTimeNotAtScheduleTime(t *testing.T) {
+	sh := shadow.NewStore()
+	sh.Observe("alarm", "status", "armed")
+
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"motion.detected"},
+		Steps: []rules.StepConfig{
+			push("a", "1"),
+			{Do: "redis", List: "b", Push: "2", After: "30ms", When: `state("alarm", "status") == "armed"`},
+		},
+	}, sh.Get)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	rn := NewRunner(startedPool(t, 1, 8), testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "motion.detected"})
+
+	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
+	sh.Observe("alarm", "status", "disarmed")
+
+	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v, want only one; when must be re-evaluated at fire time", got)
+	}
+}
+
+// TestPendingStepOccupiesNoWorker is the whole reason after exists: a step
+// waiting out its delay must hold no worker, so the pool's one worker stays
+// free for anything else.
+func TestPendingStepOccupiesNoWorker(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "200ms"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	pool := startedPool(t, 1, 8)
+	rn := NewRunner(pool, testSched(t), nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
+
+	unrelated := make(chan struct{})
+	start := time.Now()
+	if !pool.Submit(fnAction{fn: func() error { close(unrelated); return nil }}, eventbus.Event{}, "unrelated", nil) {
+		t.Fatal("unrelated action was refused")
+	}
+	select {
+	case <-unrelated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unrelated action never ran")
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("unrelated action took %v to run; a pending step must not occupy the pool's only worker", elapsed)
+	}
+
+	waitFor(t, "the run to end", func() bool { return rn.Active() == 0 })
+}
+
+func TestRunnerStopCancelsAPendingTail(t *testing.T) {
+	rec := &recorder{}
+	r := compileRule(t, rules.RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "30ms"}},
+	}, nil)
+	s := seqWith(t, r, rec.step("one"), rec.step("two"))
+
+	sch := testSched(t)
+	rn := NewRunner(startedPool(t, 1, 8), sch, nopLog{})
+	rn.Fire(s, eventbus.Event{Topic: "x.y"})
+
+	waitFor(t, "step one to run", func() bool { return len(rec.list()) >= 1 })
+	rn.Stop()
+
+	// Longer than the 30ms after: a surviving timer would have fired by now.
+	time.Sleep(60 * time.Millisecond)
+	if got := rec.list(); !equal(got, []string{"one"}) {
+		t.Errorf("steps ran as %v after Stop, want only one; Stop must cancel a pending tail", got)
+	}
+	if got := sch.Pending(); got != 0 {
+		t.Errorf("scheduler has %d pending fire(s) after Stop, want 0", got)
+	}
+}
+
+func TestNegativeAfterIsRejectedAtCompileTimeNamingTheStep(t *testing.T) {
+	_, errs := rules.Compile([]rules.RuleConfig{{
+		Name: "r", On: []string{"x.y"},
+		Steps: []rules.StepConfig{push("a", "1"), {Do: "redis", List: "b", Push: "2", After: "-5s"}},
+	}}, func(string, string) string { return "" })
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1: %v", len(errs), errs)
+	}
+	msg := errs[0].Error()
+	for _, want := range []string{`"r"`, "step 1"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should mention %s, got %q", want, msg)
+		}
 	}
 }

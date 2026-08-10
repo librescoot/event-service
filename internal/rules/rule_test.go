@@ -3,6 +3,7 @@ package rules
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/librescoot/eventbus"
 )
@@ -145,19 +146,37 @@ func TestCompileRejectsMissingSteps(t *testing.T) {
 	}
 }
 
-func TestCompileRejectsUnsupportedFeaturesByName(t *testing.T) {
-	cases := map[string]RuleConfig{
-		"after": {Name: "b", On: []string{"x.y"}, Steps: []StepConfig{{Do: "redis", List: "l", Push: "p", After: "30s"}}},
+func TestCompileParsesStepAfter(t *testing.T) {
+	r := mustCompileOne(t, RuleConfig{
+		Name: "r", On: []string{"x.y"},
+		Steps: []StepConfig{
+			{Do: "redis", List: "l", Push: "p"},
+			{Do: "redis", List: "l", Push: "p", After: "30s"},
+		},
+	}, noState)
+
+	if r.Steps[0].After != 0 {
+		t.Errorf("a step without after should parse to a zero duration, got %v", r.Steps[0].After)
 	}
-	for label, c := range cases {
-		_, errs := Compile([]RuleConfig{c}, noState)
-		if len(errs) != 1 {
-			t.Errorf("%s: got %d errors, want 1", label, len(errs))
-			continue
-		}
-		if !strings.Contains(errs[0].Error(), "not supported yet") {
-			t.Errorf("%s: error should name the limitation, got %v", label, errs[0])
-		}
+	if r.Steps[1].After != 30*time.Second {
+		t.Errorf("after = %v, want 30s", r.Steps[1].After)
+	}
+}
+
+func TestCompileRejectsNegativeAfterNamingTheStep(t *testing.T) {
+	_, errs := Compile([]RuleConfig{{
+		Name: "r", On: []string{"x.y"},
+		Steps: []StepConfig{
+			{Do: "redis", List: "l", Push: "p"},
+			{Do: "redis", List: "l", Push: "p", After: "-1s"},
+		},
+	}}, noState)
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors, want 1", len(errs))
+	}
+	msg := errs[0].Error()
+	if !strings.Contains(msg, "step 1") {
+		t.Errorf("error should name the step index, got %q", msg)
 	}
 }
 
