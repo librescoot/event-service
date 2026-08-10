@@ -2,6 +2,7 @@ package action
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -46,7 +47,7 @@ func TestPoolRunsSubmittedActions(t *testing.T) {
 
 	a := &fakeAction{}
 	for i := 0; i < 5; i++ {
-		if !p.Submit(a, eventbus.Event{Topic: "x.y"}, "r") {
+		if !p.Submit(a, eventbus.Event{Topic: "x.y"}, "r", nil) {
 			t.Fatalf("submit %d was rejected with a free queue", i)
 		}
 	}
@@ -77,7 +78,7 @@ func TestPoolRefusesWhenQueueFullAndNeverBlocksTheCaller(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 50; i++ {
-			if p.Submit(a, eventbus.Event{Topic: "x.y"}, "r") {
+			if p.Submit(a, eventbus.Event{Topic: "x.y"}, "r", nil) {
 				accepted++
 			}
 		}
@@ -104,7 +105,7 @@ func TestPoolCountsFailures(t *testing.T) {
 	defer p.Stop()
 
 	a := &fakeAction{failWith: context.DeadlineExceeded}
-	p.Submit(a, eventbus.Event{Topic: "x.y"}, "r")
+	p.Submit(a, eventbus.Event{Topic: "x.y"}, "r", nil)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for p.Stats().Failed == 0 && time.Now().Before(deadline) {
@@ -130,7 +131,7 @@ func TestPoolStopWaitsForInFlightWork(t *testing.T) {
 		finished = true
 		mu.Unlock()
 		return nil
-	}), eventbus.Event{Topic: "x.y"}, "r")
+	}), eventbus.Event{Topic: "x.y"}, "r", nil)
 
 	<-started
 	close(release)
@@ -153,7 +154,7 @@ func TestSubmitAfterStopReturnsFalseWithoutPanic(t *testing.T) {
 	p.Stop()
 
 	a := &fakeAction{}
-	if p.Submit(a, eventbus.Event{Topic: "x.y"}, "r") {
+	if p.Submit(a, eventbus.Event{Topic: "x.y"}, "r", nil) {
 		t.Error("Submit after Stop returned true, want false")
 	}
 	if s := p.Stats(); s.Dropped == 0 {
@@ -178,7 +179,7 @@ func TestStopCancelsRunningActionsContext(t *testing.T) {
 		<-ctx.Done()
 		sawCancel.Store(true)
 		return ctx.Err()
-	}), eventbus.Event{Topic: "x.y"}, "r")
+	}), eventbus.Event{Topic: "x.y"}, "r", nil)
 
 	<-started
 
@@ -215,12 +216,12 @@ func TestStopCountsAbandonedQueuedJobsAsDropped(t *testing.T) {
 		close(started)
 		<-release
 		return nil
-	}), eventbus.Event{Topic: "x.y"}, "r")
+	}), eventbus.Event{Topic: "x.y"}, "r", nil)
 	<-started
 
 	noop := actionFunc(func(ctx context.Context, e eventbus.Event) error { return nil })
 	for i := 0; i < 3; i++ {
-		if !p.Submit(noop, eventbus.Event{Topic: "x.y"}, "r") {
+		if !p.Submit(noop, eventbus.Event{Topic: "x.y"}, "r", nil) {
 			t.Fatalf("submit %d was refused with a free queue", i)
 		}
 	}
@@ -282,7 +283,7 @@ func TestConcurrentSubmitAndStopDoesNotPanic(t *testing.T) {
 			go func() {
 				defer submitWG.Done()
 				for j := 0; j < submitsPerGoroutine; j++ {
-					p.Submit(a, eventbus.Event{Topic: "x.y"}, "r")
+					p.Submit(a, eventbus.Event{Topic: "x.y"}, "r", nil)
 				}
 			}()
 		}
@@ -293,8 +294,143 @@ func TestConcurrentSubmitAndStopDoesNotPanic(t *testing.T) {
 		p.Stop()
 		submitWG.Wait()
 
-		if p.Submit(a, eventbus.Event{Topic: "x.y"}, "r") {
+		if p.Submit(a, eventbus.Event{Topic: "x.y"}, "r", nil) {
 			t.Fatalf("pool %d: Submit after Stop returned true, want false", i)
 		}
+	}
+}
+
+func TestSubmitCallsDoneWithNilOnSuccess(t *testing.T) {
+	p := NewPool(1, 4, nopLog{})
+	p.Start()
+	defer p.Stop()
+
+	a := &fakeAction{}
+	doneCh := make(chan error, 1)
+	if !p.Submit(a, eventbus.Event{Topic: "x.y"}, "r", func(err error) {
+		doneCh <- err
+	}) {
+		t.Fatal("submit was rejected with a free queue")
+	}
+
+	select {
+	case err := <-doneCh:
+		if err != nil {
+			t.Errorf("done called with %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("done was never called")
+	}
+}
+
+func TestSubmitCallsDoneWithTheActionError(t *testing.T) {
+	p := NewPool(1, 4, nopLog{})
+	p.Start()
+	defer p.Stop()
+
+	wantErr := context.DeadlineExceeded
+	a := &fakeAction{failWith: wantErr}
+	doneCh := make(chan error, 1)
+	if !p.Submit(a, eventbus.Event{Topic: "x.y"}, "r", func(err error) {
+		doneCh <- err
+	}) {
+		t.Fatal("submit was rejected with a free queue")
+	}
+
+	select {
+	case err := <-doneCh:
+		if err != wantErr {
+			t.Errorf("done called with %v, want %v", err, wantErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("done was never called")
+	}
+}
+
+// Refused jobs must not look like completed jobs: a caller that treats
+// refusal as completion would advance a sequence past a step that never ran.
+func TestDoneIsNotCalledWhenQueueIsFull(t *testing.T) {
+	block := make(chan struct{})
+	blocker := &fakeAction{block: block}
+
+	p := NewPool(1, 1, nopLog{})
+	p.Start()
+	defer func() { close(block); p.Stop() }()
+
+	if !p.Submit(blocker, eventbus.Event{Topic: "x.y"}, "r", nil) {
+		t.Fatal("submit was rejected with a free queue")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for blocker.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if blocker.count() == 0 {
+		t.Fatal("blocking job was never picked up by the worker")
+	}
+
+	filler := &fakeAction{}
+	if !p.Submit(filler, eventbus.Event{Topic: "x.y"}, "r", nil) {
+		t.Fatal("submit was rejected while the queue had room")
+	}
+
+	called := false
+	if p.Submit(&fakeAction{}, eventbus.Event{Topic: "x.y"}, "r", func(err error) {
+		called = true
+	}) {
+		t.Fatal("Submit returned true with a full queue and a busy worker")
+	}
+	if called {
+		t.Error("done was called for a submission refused because the queue was full")
+	}
+}
+
+// Refused jobs must not look like completed jobs, mirroring
+// TestDoneIsNotCalledWhenQueueIsFull for the other refusal path.
+func TestDoneIsNotCalledWhenPoolIsStopped(t *testing.T) {
+	p := NewPool(1, 4, nopLog{})
+	p.Start()
+	p.Stop()
+
+	called := false
+	if p.Submit(&fakeAction{}, eventbus.Event{Topic: "x.y"}, "r", func(err error) {
+		called = true
+	}) {
+		t.Fatal("Submit after Stop returned true, want false")
+	}
+	if called {
+		t.Error("done was called for a submission refused because the pool was stopped")
+	}
+}
+
+// TestDoneMaySubmitAnotherJob proves the sequence-advance path: a done
+// callback running on the worker goroutine can call Submit again to queue
+// the next step, and that submission is accepted and runs.
+func TestDoneMaySubmitAnotherJob(t *testing.T) {
+	p := NewPool(1, 4, nopLog{})
+	p.Start()
+	defer p.Stop()
+
+	second := &fakeAction{}
+	secondDone := make(chan error, 1)
+
+	first := &fakeAction{}
+	if !p.Submit(first, eventbus.Event{Topic: "x.y"}, "r", func(err error) {
+		if !p.Submit(second, eventbus.Event{Topic: "x.y"}, "r", func(err error) {
+			secondDone <- err
+		}) {
+			secondDone <- fmt.Errorf("submit from within done was refused")
+		}
+	}) {
+		t.Fatal("submit was rejected with a free queue")
+	}
+
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Errorf("second step: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second step never ran; done-triggered Submit did not advance the sequence")
 	}
 }

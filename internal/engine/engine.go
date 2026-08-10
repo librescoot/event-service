@@ -95,7 +95,7 @@ func (en *Engine) Handle(e eventbus.Event) {
 		if !b.allow(now) {
 			continue
 		}
-		en.pool.Submit(b.action, e, b.rule.Name)
+		en.pool.Submit(b.action, e, b.rule.Name, nil)
 	}
 }
 

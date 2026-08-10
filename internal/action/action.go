@@ -45,6 +45,7 @@ type job struct {
 	action Action
 	event  eventbus.Event
 	rule   string
+	done   func(error)
 }
 
 // Pool runs actions on a fixed number of workers behind a bounded queue.
@@ -127,9 +128,13 @@ func (p *Pool) run() {
 		select {
 		case j := <-p.jobs:
 			p.dispatched.Add(1)
-			if err := j.action.Do(p.runCtx, j.event); err != nil {
+			err := j.action.Do(p.runCtx, j.event)
+			if err != nil {
 				p.failed.Add(1)
 				p.log.Printf("rule %s: %s action failed: %v", j.rule, j.action.Kind(), err)
+			}
+			if j.done != nil {
+				j.done(err)
 			}
 		case <-p.done:
 			return
@@ -141,7 +146,16 @@ func (p *Pool) run() {
 // called concurrently with or after Stop: if the queue is full, or the pool
 // is stopping, the job is refused and counted rather than sent, because
 // blocking here would stall event delivery for every other rule.
-func (p *Pool) Submit(a Action, e eventbus.Event, rule string) bool {
+//
+// done, if not nil, is called on the worker goroutine after Do returns, with
+// Do's error (nil on success). It runs inline on the worker, so it must be
+// cheap. done is called only when the job actually ran: a refused job (queue
+// full, or the pool stopping) never invokes it, so a caller can tell "ran"
+// from "refused" purely from Submit's return value without done ever firing
+// for the latter. It is legal for done to call Submit again to queue the
+// next step in a sequence; because Submit never blocks, this cannot
+// deadlock even though it runs from inside a worker.
+func (p *Pool) Submit(a Action, e eventbus.Event, rule string, done func(error)) bool {
 	select {
 	case <-p.done:
 		p.dropped.Add(1)
@@ -151,7 +165,7 @@ func (p *Pool) Submit(a Action, e eventbus.Event, rule string) bool {
 	}
 
 	select {
-	case p.jobs <- job{action: a, event: e, rule: rule}:
+	case p.jobs <- job{action: a, event: e, rule: rule, done: done}:
 		return true
 	case <-p.done:
 		p.dropped.Add(1)
