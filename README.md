@@ -3,30 +3,93 @@
 Turns Librescoot system state changes into a normalised event bus, and runs
 user-defined rules against it.
 
-See `EVENT-SERVICE-DESIGN.md` in the librescoot tree for the design.
+The service runs on the MDB. It is being integrated into nightly images ahead
+of Librescoot 1.4.0; it is not included in 1.3.1 stable images. No automation
+rules are installed by default.
+
+See the [technical reference](https://github.com/librescoot/unu-tech-reference/blob/main/services/librescoot-events.md)
+for the event catalogue and Redis interface.
 
 ## Build
 
-    make build        # ARM, for the MDB
-    make build-host   # native, for development
-    make test
+Requires Go 1.25.7. The Makefile selects that toolchain automatically.
+
+```sh
+make build        # Linux ARMv7: bin/event-service (also make build-arm)
+make build-host   # native: bin/event-service-host
+make test
+make lint         # requires golangci-lint
+```
+
+Live datastore tests require a disposable Redis/Valkey at `localhost:6379`
+and skip when it is unavailable. Do not point the test suite at a vehicle.
 
 ## Run
 
-    event-service --redis localhost:6379 --log-level info
+```sh
+./bin/event-service-host --redis localhost:6379
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--redis` | `localhost:6379` | Datastore address |
+| `--rules-dir` | `/data/extensions` | Rule directory |
+| `--workers` | `2` | Action workers |
+| `--queue` | `256` | Action queue capacity |
+| `--replay-window` | `5m` | Maximum lateness for pending-step replay |
+| `--stats-interval` | `10s` | Counter refresh interval; only changes are written |
+| `--log-level` | `info` | Printed at startup; does not currently filter logging |
+
+### On the MDB
+
+The image recipe installs `/usr/bin/event-service` and enables
+[`librescoot-events.service`](https://github.com/librescoot/meta-librescoot/blob/wrynose/recipes-core/event-service/files/librescoot-events.service).
+The unit waits for `/data` and starts after Valkey. A missing rules directory
+is normal and loads zero rules.
+
+Install only trusted rules and executable scripts: the packaged service runs
+as root. Keep the directory and its contents writable only by trusted users.
+
+```sh
+install -d -m 0700 /data/extensions
+# Install your reviewed .toml files and executable scripts, then:
+systemctl restart librescoot-events
+journalctl -u librescoot-events -n 50 --no-pager
+redis-cli HGETALL extensions
+```
+
+Files are loaded non-recursively, in filename order, from lowercase `*.toml`
+files. There is no hot reload, SIGHUP reload, or validation-only CLI; restart
+for changes to take effect. Invalid files/rules are logged and skipped while
+valid rules can still run, so check the logs and loaded-rule count, not just
+whether the unit is active. `lsc ext` is not implemented yet.
 
 ## Observing the bus
 
-    redis-cli psubscribe 'ev:*'
-    redis-cli xrevrange events + - COUNT 10
+```sh
+redis-cli psubscribe 'ev:*'
+redis-cli xrevrange events + - COUNT 10
+```
+
+| Interface | Contents |
+|---|---|
+| `ev:<topic>` | Live JSON event envelopes |
+| `events` | Recent adapter events; stream fields `topic` and `e` (JSON), approximately 2000 entries |
+| `extensions` | Version, rule count and runtime counters; read with `HGETALL` |
+| `extensions:pending` | Internal pending-step records; do not edit while running |
+
+Rules consume live Pub/Sub, not the stream. Triggers missed while the service
+is down or disconnected are not replayed. The adapter observes notified hash
+values rather than atomic producer transitions; rapid intermediate values can
+be missed. It does not provide an authoritative vehicle transition log.
 
 ## Rules
 
 Drop `*.toml` files into the extensions directory (`--rules-dir`, default
 `/data/extensions`) and event-service loads them at startup and runs them
 against the bus. With no files present it does not subscribe to anything
-extra, so a scooter with no extensions installed pays nothing for this
-feature.
+extra. Workers and the statistics infrastructure still exist even with zero
+rules.
 
 Example, `/data/extensions/demo.toml`:
 
@@ -45,12 +108,11 @@ Example, `/data/extensions/demo.toml`:
 an expression evaluated against the event: `topic`, `src`, `from`, `to`,
 `data`, and `state("hash", "field")` for reading the last observed value of a
 hash field that the event itself does not carry. `state` reads event-service's
-own in-memory shadow store, not the datastore directly: only the handful of
-hashes an adapter watches are in it, and only fields seen since the process
-started. A field that exists in the datastore but has not changed since
-startup, or that belongs to a hash nothing watches, reads back as `""`,
-indistinguishable from a genuinely empty value. A rule with no `when` fires on
-every event matching `on`.
+in-memory shadow store, not the datastore directly. Watched hashes are seeded
+at startup without emitting transitions; later notifications update them.
+Unwatched or missing fields return `""`, indistinguishable from an empty value.
+Changes without a corresponding notification can leave the shadow stale. A
+rule with no `when` fires on every event matching `on`.
 
 Supported `do` kinds for `[[rule.step]]`:
 
@@ -58,7 +120,10 @@ Supported `do` kinds for `[[rule.step]]`:
 - `exec`: run a command with `command` and an optional `timeout`, default
   `10s`. The event is on stdin as JSON, plus `LS_TOPIC`, `LS_SRC`, `LS_FROM`,
   `LS_TO`, `LS_ID` and one `LS_DATA_<KEY>` per scalar `data` field, so a short
-  shell script needs no JSON parser.
+  shell script needs no JSON parser. `command` is an executable name or path,
+  not shell text or an argument string. Put arguments and pipelines in an
+  executable wrapper script. Standard output is discarded; failed-command
+  stderr is included in the error log.
 
 ### Step sequences
 
@@ -67,10 +132,10 @@ starts only once the one before it has finished. A step that fails ends the
 run and the steps after it do not run: a sequence is a recipe, so carrying on
 would act on a state the failed step never established.
 
-A step can carry its own `when`, checked immediately before that step runs
-and evaluated against the event that triggered the rule, with `state()`
-reading whatever is current at that moment. A false step `when` ends the run
-cleanly; it does not skip ahead to the next step.
+A step can carry its own `when`, checked before it is submitted to the worker
+pool and evaluated against the event that triggered the rule, with `state()`
+reading whatever is current at that moment. A queued action may run later. A
+false step `when` ends the run cleanly; it does not skip ahead to the next step.
 
 A step can also carry `after` (a duration), which runs it that long after the
 step before it finished. A step waiting out its delay holds no worker and no
@@ -96,21 +161,37 @@ Here is the rule this feature was built for, exactly as it loads:
       list  = "scooter:blinker"
       push  = "off"
 
-On the alarm, the hazards go on straight away, and thirty seconds later the
-second step turns them off, unless something disarms the rule first (see
-`cancel-on` below).
+On the alarm, the hazards go on, and thirty seconds later the second step
+requests off. Disarming cancels that delayed step; cancellation does not undo
+an action that already ran. To request off on disarm, add a companion rule:
+
+    [[rule]]
+    name = "hazards-off-on-disarm"
+    on   = ["alarm.disarmed"]
+
+      [[rule.step]]
+      do   = "redis"
+      list = "scooter:blinker"
+      push = "off"
+
+Actions already accepted by the worker pool are not interrupted, so these
+rules do not guarantee ordering against an in-flight action or another caller
+of the blinker queue. They are examples, not a hardware safety interlock.
 
 ### Durability
 
-A step with `after` is also `durable` unless it says otherwise. The waiting
-step is written to the `extensions:pending` hash when it is scheduled and
-removed when it fires or is cancelled, so a service restart in the middle of
-the wait does not strand the vehicle half-changed: "hazards on, hazards off
-thirty seconds later" still turns them off if the service goes down at second
-five. On start, a recorded step whose delay has run out is run straight away
-and one still in the future waits out what is left of it, both before the
-first event is handled. A rule with `repeat` comes back on the pass it was on
-and finishes the passes it had left, rather than starting its count over.
+A step with a positive `after` is also `durable` unless it says otherwise.
+The waiting step is written to `extensions:pending` when scheduled and removed
+when its action starts or the run is cancelled. This supports recovery across
+an **event-service process restart while Valkey retains its data**. The image's
+Valkey configuration disables disk persistence, so this is not recovery across
+a vehicle reboot, power loss, or datastore restart.
+
+On start, overdue recorded steps are submitted and future steps have their
+remaining delay rearmed before the rule subscription opens. Replay does not
+wait for those actions to complete. A rule with `repeat` comes back on the
+pass it was on and finishes the passes it had left, rather than starting its
+count over.
 
 A record is thrown away instead, with a line saying why, if its rule is gone,
 if its rule no longer has that step, if the step at that index is not the one
@@ -131,10 +212,16 @@ for it keeps its record instead: it provably did not run, so the next start is
 what runs it, and the same goes for a step still sitting in the pool's queue
 when the service is stopped.
 
-Write `durable = false` on the step to opt out, and note that nothing is
-recorded for a `repeat` gap or for a trigger sitting in a `queue` backlog:
-neither has acted on the vehicle yet. `durable` on a step without `after`
-fails to load rather than doing nothing quietly.
+Write `durable = false` on the step to opt out. Nothing is recorded for a
+`repeat` gap or for a trigger sitting in a `queue` backlog. Earlier repeat
+passes may already have acted. Explicit `durable` without a positive `after`
+fails to load; `after = "0s"` by itself is immediate and non-durable.
+
+Recovery is not exactly-once execution. If recording fails, the error is logged
+but the step continues without a durable record. Failed deletion can cause a
+later replay; a crash after deletion but before successful action completion
+can lose the action. Use idempotent actions and account for those failure
+windows.
 
 ### Concurrency and cancellation
 
@@ -153,9 +240,9 @@ has not finished yet:
 `cancel-on` takes topics in the same form as `on`, and an event matching one
 of them drops every live run of that rule: pending timers are cancelled, the
 queued backlog is thrown away, and no further step is submitted. It is applied
-before matching, so a single event can cancel one rule and fire another, which
-is how "blink the hazards, stop 30s later" is made to stop early when the
-rider disarms at second five.
+before matching, so a single event can cancel one rule and fire another.
+Cancellation does not issue an off command or undo prior actions; use an
+explicit cleanup rule where appropriate.
 
 A step that has already been handed to the worker pool when the cancel arrives
 is **not** interrupted, and that covers both a step a worker is running and one
@@ -245,7 +332,7 @@ Step level:
 | `do` | required: `redis` or `exec` |
 | `when` | none: step always runs |
 | `after` | none: step runs as soon as it is reached |
-| `durable` | `true` if `after` is set; the key is a load error on a step with no `after` |
+| `durable` | `true` if `after` is positive; explicitly setting it otherwise is a load error |
 | `list`, `push` | required for `do = "redis"` |
 | `command` | required for `do = "exec"` |
 | `timeout` | `10s`, for `do = "exec"` |
@@ -257,14 +344,15 @@ A `redis` step can `LPUSH` onto `scooter:state`, `scooter:horn`,
 `scooter:blinker`, `scooter:seatbox`, or any other command queue, as freely as
 vehicle-service's legitimate callers can. Two rules can watch each other's
 output topics and cycle a command back and forth indefinitely, including
-through the steering lock; nothing here detects or breaks that loop. This is
-the same position `EVENT-SERVICE-DESIGN.md` takes on the `can` step kind: the
-extension subsystem is a power-user feature, and it is deliberately not
-event-service's job to second-guess what a rule tells the vehicle to do.
+through the steering lock; nothing here detects or breaks that loop. The
+extension subsystem is a power-user feature; event-service does not
+second-guess what a rule tells the vehicle to do. The unit's CPU weight,
+memory limit and task limit reduce contention, but are not a security sandbox
+or a guarantee against datastore flooding.
 Write rules with that in mind.
 
-Durability extends the same stance across a restart. A step with `after`
-survives the service going down and comes back to finish on the next start,
+Durability extends the same stance across a process restart. A recorded step
+with a positive `after` can come back on the next service start,
 so a rule nobody retriggered this session, sitting on a wait from before the
 restart, can still `LPUSH` onto a command queue once the service is back up,
 without any event happening in between that the rider watching the vehicle
@@ -273,3 +361,7 @@ that already told the vehicle to do half of something finishes the other
 half, and there is no separate check asking whether it still should. Do not
 write an `after` step onto a command queue you would not want fired by
 something that happened before the current rider ever saw the vehicle.
+
+## License
+
+[GNU AGPL-3.0](LICENSE).
