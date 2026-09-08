@@ -516,7 +516,9 @@ func (rn *Runner) runStep(r *run, idx int, step CompiledStep) {
 			// would run "turn the hazards off" against a state the earlier
 			// step never established. The pool has already logged and counted
 			// the action's own error; this line says what it cost.
-			rn.log.Printf("rule %s: step %d failed, %d later step(s) skipped", name, idx, len(r.seq.Steps)-idx-1)
+			if step.Action.Kind() != "can" {
+				rn.log.Printf("rule %s: step %d failed, %d later step(s) skipped", name, idx, len(r.seq.Steps)-idx-1)
+			}
 			rn.end(r)
 			return
 		}

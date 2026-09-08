@@ -47,12 +47,12 @@ type Engine struct {
 // carries an after delay, and the pending timer behind any rule's debounce.
 // store records the steps that are waiting so a restart can pick them up; a
 // nil store leaves the runner entirely in memory.
-func New(rs []*rules.Rule, pool *action.Pool, sch *sched.Scheduler, store *seq.PendingStore, c action.Pusher, log Logger) (*Engine, []error) {
+func New(rs []*rules.Rule, pool *action.Pool, sch *sched.Scheduler, store *seq.PendingStore, c action.Pusher, log Logger, options ...action.BuildOption) (*Engine, []error) {
 	en := &Engine{runner: seq.NewRunner(pool, sch, store, log), sch: sch, log: log}
 	var errs []error
 
 	for _, r := range rs {
-		s, err := seq.Build(r, c)
+		s, err := seq.Build(r, c, options...)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("rule %q in %s: %w", r.Name, r.Source, err))
 			continue

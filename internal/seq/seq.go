@@ -45,7 +45,7 @@ type CompiledStep struct {
 
 // Build compiles every step of r. An error names the step index; the caller
 // adds the rule and the file.
-func Build(r *rules.Rule, c action.Pusher) (*Sequence, error) {
+func Build(r *rules.Rule, c action.Pusher, options ...action.BuildOption) (*Sequence, error) {
 	s := &Sequence{Rule: r, Steps: make([]CompiledStep, 0, len(r.Steps))}
 
 	for i, step := range r.Steps {
@@ -55,7 +55,12 @@ func Build(r *rules.Rule, c action.Pusher) (*Sequence, error) {
 			Push:    step.Config.Push,
 			Command: step.Config.Command,
 			Timeout: step.Config.Timeout,
-		}, c)
+			Iface:   step.Config.Iface,
+			ID:      step.Config.ID,
+			Data:    step.Config.Data,
+			RTR:     step.Config.RTR,
+			DLC:     step.Config.DLC,
+		}, c, options...)
 		if err != nil {
 			return nil, fmt.Errorf("step %d: %w", i, err)
 		}

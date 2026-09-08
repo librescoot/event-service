@@ -71,6 +71,13 @@ type StepConfig struct {
 	// exec
 	Command string `toml:"command"`
 	Timeout string `toml:"timeout"`
+
+	// Classic CAN. DLC is only explicit for remote-request frames.
+	Iface string `toml:"iface"`
+	ID    string `toml:"id"`
+	Data  string `toml:"data"`
+	RTR   bool   `toml:"rtr"`
+	DLC   *int   `toml:"dlc"`
 }
 
 // Load reads every *.toml in dir. A file that fails to parse, or that

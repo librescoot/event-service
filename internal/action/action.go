@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/librescoot/event-service/internal/canbus"
 	"github.com/librescoot/eventbus"
 )
 
@@ -131,7 +132,11 @@ func (p *Pool) run() {
 			err := j.action.Do(p.runCtx, j.event)
 			if err != nil {
 				p.failed.Add(1)
-				p.log.Printf("rule %s: %s action failed: %v", j.rule, j.action.Kind(), err)
+				// CAN failures are counted here and logged by the sender only
+				// at debug: a disconnected bus must not flood the journal.
+				if j.action.Kind() != "can" {
+					p.log.Printf("rule %s: %s action failed: %v", j.rule, j.action.Kind(), err)
+				}
 			}
 			if j.done != nil {
 				j.done(err)
@@ -225,10 +230,30 @@ type Spec struct {
 	Push    string
 	Command string
 	Timeout string
+	Iface   string
+	ID      string
+	Data    string
+	RTR     bool
+	DLC     *int
+}
+
+type buildOptions struct {
+	can CANSender
+}
+
+// BuildOption supplies service-owned action dependencies.
+type BuildOption func(*buildOptions)
+
+func WithCAN(sender CANSender) BuildOption {
+	return func(o *buildOptions) { o.can = sender }
 }
 
 // Build turns a step spec into a runnable action.
-func Build(s Spec, c Pusher) (Action, error) {
+func Build(s Spec, c Pusher, options ...BuildOption) (Action, error) {
+	var opts buildOptions
+	for _, option := range options {
+		option(&opts)
+	}
 	switch s.Do {
 	case "redis":
 		return NewRedisAction(c, s.List, s.Push)
@@ -238,7 +263,9 @@ func Build(s Spec, c Pusher) (Action, error) {
 			return nil, err
 		}
 		return NewExecAction(s.Command, timeout)
-	case "can", "lua", "http":
+	case "can":
+		return newCANAction(canbus.Spec{Iface: s.Iface, ID: s.ID, Data: s.Data, RTR: s.RTR, DLC: s.DLC}, opts.can)
+	case "lua", "http":
 		return nil, fmt.Errorf("action %q is not supported yet", s.Do)
 	case "":
 		return nil, fmt.Errorf("step is missing do")

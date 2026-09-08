@@ -32,10 +32,8 @@ func TestBuildRejectsUnknownKind(t *testing.T) {
 	}
 }
 
-// can, lua and http are named in the design but not built yet. The error must
-// say so, rather than reading as a typo.
 func TestBuildNamesDeferredKinds(t *testing.T) {
-	for _, kind := range []string{"can", "lua", "http"} {
+	for _, kind := range []string{"lua", "http"} {
 		_, err := Build(Spec{Do: kind}, &fakePusher{})
 		if err == nil {
 			t.Errorf("%s should be rejected for now", kind)

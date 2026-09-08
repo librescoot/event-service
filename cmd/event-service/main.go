@@ -12,6 +12,7 @@ import (
 
 	"github.com/librescoot/event-service/internal/action"
 	"github.com/librescoot/event-service/internal/adapter"
+	"github.com/librescoot/event-service/internal/canbus"
 	"github.com/librescoot/event-service/internal/engine"
 	"github.com/librescoot/event-service/internal/rules"
 	"github.com/librescoot/event-service/internal/sched"
@@ -45,7 +46,7 @@ type logger interface {
 //
 // Pulled out of main so its field mapping has something other than main
 // itself to exercise it: main is not otherwise reached by the test suite.
-func buildSnapshot(pool *action.Pool, sch *sched.Scheduler, en *engine.Engine, version string) map[string]string {
+func buildSnapshot(pool *action.Pool, sch *sched.Scheduler, en *engine.Engine, version string, cs canbus.Stats) map[string]string {
 	ps := pool.Stats()
 	return map[string]string{
 		"rules":       strconv.Itoa(en.RuleCount()),
@@ -56,6 +57,8 @@ func buildSnapshot(pool *action.Pool, sch *sched.Scheduler, en *engine.Engine, v
 		"pending":     strconv.Itoa(sch.Pending()),
 		"runs-active": strconv.Itoa(en.Active()),
 		"version":     version,
+		"can-sent":    strconv.FormatUint(cs.Sent, 10),
+		"can-errors":  strconv.FormatUint(cs.Errors, 10),
 	}
 }
 
@@ -160,7 +163,12 @@ func main() {
 
 	store := seq.NewPendingStore(seq.NewClientHasher(client), log.Default())
 
-	en, buildErrs := engine.New(compiled, pool, sch, store, client, log.Default())
+	var debugCAN func(string, ...any)
+	if *logLevel == "debug" {
+		debugCAN = log.Printf
+	}
+	canSender := canbus.New(debugCAN)
+	en, buildErrs := engine.New(compiled, pool, sch, store, client, log.Default(), action.WithCAN(canSender))
 	for _, err := range buildErrs {
 		log.Printf("rules: %v", err)
 	}
@@ -172,7 +180,7 @@ func main() {
 	// hash is populated before anything can move.
 	statsPub := stats.NewPublisher(client, statsInterval, log.Default())
 	statsPub.Start(func() map[string]string {
-		return buildSnapshot(pool, sch, en, version)
+		return buildSnapshot(pool, sch, en, version, canSender.Stats())
 	})
 
 	stopSub := startRules(en, *replayWin, func(patterns []string) func() {
@@ -214,6 +222,9 @@ func main() {
 	en.Stop()
 	sch.Stop()
 	pool.Stop()
+	if err := canSender.Close(); err != nil {
+		log.Printf("CAN close: %v", err)
+	}
 	statsPub.Stop()
 	ad.Stop()
 	if err := client.Close(); err != nil {

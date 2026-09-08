@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/librescoot/event-service/internal/action"
+	"github.com/librescoot/event-service/internal/canbus"
 	"github.com/librescoot/event-service/internal/engine"
 	"github.com/librescoot/event-service/internal/rules"
 	"github.com/librescoot/event-service/internal/sched"
@@ -140,7 +141,10 @@ func TestBuildSnapshotKeepsDroppedAndRefusedApart(t *testing.T) {
 	}
 	waitFor(t, func() bool { return en.Refused() == 5 })
 
-	got := buildSnapshot(pool, sch, en, "v1.2.3")
+	got := buildSnapshot(pool, sch, en, "v1.2.3", canbus.Stats{Sent: 23, Errors: 7})
+	if got["can-sent"] != "23" || got["can-errors"] != "7" {
+		t.Fatalf("CAN counter mapping: %v", got)
+	}
 
 	if got["dropped"] != strconv.FormatUint(pool.Stats().Dropped, 10) {
 		t.Errorf(`snapshot["dropped"] = %q, want the pool's own Dropped (%d)`, got["dropped"], pool.Stats().Dropped)

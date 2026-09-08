@@ -24,6 +24,21 @@ make lint         # requires golangci-lint
 Live datastore tests require a disposable Redis/Valkey at `localhost:6379`
 and skip when it is unavailable. Do not point the test suite at a vehicle.
 
+The optional SocketCAN integration test uses a virtual interface in an isolated
+Linux network namespace, never the vehicle's CAN bus:
+
+```sh
+GOTOOLCHAIN=go1.25.7 go test -c -o /tmp/event-service-canbus-tests ./internal/canbus
+sudo unshare -n sh -ec '
+  ip link add vcan-evtest type vcan
+  ip link set vcan-evtest up
+  EVENT_SERVICE_TEST_VCAN=1 /tmp/event-service-canbus-tests -test.run TestVcanIntegration -test.v
+'
+```
+
+Requires kernel vcan support, `ip`, `unshare`, and permission to create network
+namespaces. The test skips during ordinary `make test` runs.
+
 ## Run
 
 ```sh
@@ -38,7 +53,7 @@ and skip when it is unavailable. Do not point the test suite at a vehicle.
 | `--queue` | `256` | Action queue capacity |
 | `--replay-window` | `5m` | Maximum lateness for pending-step replay |
 | `--stats-interval` | `10s` | Counter refresh interval; only changes are written |
-| `--log-level` | `info` | Printed at startup; does not currently filter logging |
+| `--log-level` | `info` | `debug` enables per-frame CAN logging; other service logs are not currently filtered |
 
 ### On the MDB
 
@@ -124,6 +139,41 @@ Supported `do` kinds for `[[rule.step]]`:
   not shell text or an argument string. Put arguments and pipelines in an
   executable wrapper script. Standard output is discarded; failed-command
   stderr is included in the error log.
+- `can`: send a classic CAN frame directly through SocketCAN, using `iface`,
+  `id`, and `data`. No helper process or receive loop is started.
+
+### CAN frames
+
+```toml
+[[rule.step]]
+do = "can"
+iface = "can0"
+id = "0x123"
+data = "01 02 03 04"
+```
+
+This illustrates syntax, not an ECU command to send. IDs are hexadecimal, with
+or without `0x`. IDs above `0x7ff` use extended frames, up to `0x1fffffff`.
+Payloads accept contiguous hex (`"01020304"`) or whitespace-separated byte
+pairs, with at most eight bytes; empty data sends a zero-length frame.
+
+An optional remote-request frame uses `rtr = true` and `dlc = 0` through `8`
+(default `0`), with no payload. It requests a response of that length rather
+than carrying data. Ordinary frames derive their length from `data` and reject
+an explicit `dlc`. No ECU behavior or support for RTR is assumed.
+
+The service opens one socket per interface lazily and reuses it, retaining at
+most 64 sockets. Sends are
+nonblocking; a full transmit queue or down interface fails the step rather
+than holding a worker or retrying a potentially delivered command. A failed
+socket is closed so a later action can reopen it. Successful send means the
+kernel accepted the frame, not that the ECU received or acknowledged it.
+
+`extensions[can-sent]` and `[can-errors]` count sends and failures. Per-frame
+logging, including transport errors, is enabled only by `--log-level=debug`;
+failures still count in the action pool's `failed` total and end the sequence.
+There is no bus-rate limit or riding-state interlock. Do not send arbitrary
+frames to the ECU; high-rate rules can interfere with its normal traffic.
 
 ### Step sequences
 
@@ -295,7 +345,7 @@ rule that fails to compile, so keeping an old copy around while a variant is
 tried, or fixing a broken rule under the name a working one already took,
 works as expected.
 
-Not supported yet: the `can`, `lua`, and `http` step kinds. A rule using any
+Not supported yet: the `lua` and `http` step kinds. A rule using any
 of these fails to load rather than silently doing nothing. The error always
 names the rule and the file; where the offending key belongs to a step
 (`do`, `after`, or a step's `when`) it also names the step index. `repeat`,
@@ -329,13 +379,17 @@ Step level:
 
 | Key | Default |
 |---|---|
-| `do` | required: `redis` or `exec` |
+| `do` | required: `redis`, `exec`, or `can` |
 | `when` | none: step always runs |
 | `after` | none: step runs as soon as it is reached |
 | `durable` | `true` if `after` is positive; explicitly setting it otherwise is a load error |
 | `list`, `push` | required for `do = "redis"` |
 | `command` | required for `do = "exec"` |
 | `timeout` | `10s`, for `do = "exec"` |
+| `iface`, `id` | required for `do = "can"`; interface name and hexadecimal ID |
+| `data` | empty; up to eight hex bytes for CAN data frames |
+| `rtr` | `false`; send a CAN remote-request frame if true |
+| `dlc` | `0` for RTR, range 0–8; rejected on ordinary data frames |
 
 ## A note on safety
 

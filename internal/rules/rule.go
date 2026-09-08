@@ -247,6 +247,18 @@ func stepFingerprint(c StepConfig, durable bool) string {
 	if durable {
 		_, _ = io.WriteString(h, "durable")
 	}
+	// Keep redis/exec fingerprints stable so adding CAN support does not
+	// discard their pending cleanup steps on the next service restart.
+	if c.Do == "can" {
+		dlc := ""
+		if c.DLC != nil {
+			dlc = strconv.Itoa(*c.DLC)
+		}
+		for _, part := range []string{c.Iface, c.ID, c.Data, strconv.FormatBool(c.RTR), dlc} {
+			_, _ = h.Write([]byte{0})
+			_, _ = io.WriteString(h, part)
+		}
+	}
 	return strconv.FormatUint(h.Sum64(), 16)
 }
 
