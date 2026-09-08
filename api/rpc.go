@@ -114,6 +114,23 @@ func Call[Req, Resp any](ctx context.Context, client *redis.Client, method strin
 	if err := ctx.Err(); err != nil {
 		return zero, err
 	}
+	// Remote boards may not have a synchronized wall clock. Use Redis's
+	// clock for the wire deadline and our context only for the local budget.
+	serverTime, err := c.Time(ctx).Result()
+	if err != nil {
+		return zero, fmt.Errorf("read RPC clock: %w", rpcContextError(ctx, err))
+	}
+	env.Deadline = serverTime.Add(time.Until(deadline)).UnixMilli()
+	body, err = json.Marshal(env)
+	if err != nil {
+		return zero, err
+	}
+	if len(body) > MaxRequestBytes {
+		return zero, errors.New("RPC request exceeds size limit")
+	}
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
 	queued, err := c.Eval(ctx, enqueueScript, []string{Channel}, body, MaxQueuedRequests).Int()
 	if err != nil {
 		return zero, uncertain(rpcContextError(ctx, err))
@@ -204,17 +221,16 @@ func serveRequest(ctx context.Context, c *redis.Client, handler func(context.Con
 	if err != nil || len(decoded) != 16 || hex.EncodeToString(decoded) != req.ID || req.ReplyChannel != Channel+":reply:"+req.ID {
 		return
 	}
-	now := time.Now()
-	deadline := time.UnixMilli(req.Deadline)
-	if !deadline.After(now) || deadline.After(now.Add(30*time.Second)) || !strings.HasPrefix(req.Method, "v1.") || len(req.Method) == 3 || len(req.Payload) == 0 {
+	now, err := c.Time(ctx).Result()
+	if err != nil {
 		return
 	}
-	// Allow a small clock-skew window in the envelope, but never grant a
-	// handler more than the protocol's five-second processing budget.
-	if ceiling := now.Add(callTimeout); deadline.After(ceiling) {
-		deadline = ceiling
+	deadline := time.UnixMilli(req.Deadline)
+	if !deadline.After(now) || deadline.After(now.Add(callTimeout)) || !strings.HasPrefix(req.Method, "v1.") || len(req.Method) == 3 || len(req.Payload) == 0 {
+		return
 	}
-	requestCtx, cancel := context.WithDeadline(ctx, deadline)
+	// Convert the shared-clock deadline to a local, bounded duration.
+	requestCtx, cancel := context.WithTimeout(ctx, min(deadline.Sub(now), callTimeout))
 	defer cancel()
 	if requestCtx.Err() != nil {
 		return

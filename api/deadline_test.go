@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestServerCapsProcessingDespiteClockSkewWindow(t *testing.T) {
+func TestServerRejectsExcessiveWireDeadline(t *testing.T) {
 	client := testRedis(t)
 	id := strings.Repeat("c", 32)
 	req := rpcRequest{id, MethodStatus, Channel + ":reply:" + id, time.Now().Add(15 * time.Second).UnixMilli(), json.RawMessage(`{}`)}
@@ -25,7 +25,7 @@ func TestServerCapsProcessingDespiteClockSkewWindow(t *testing.T) {
 		}
 		return Empty{}, nil
 	}, body)
-	if !called {
-		t.Fatal("clock-skew window did not accept request")
+	if called {
+		t.Fatal("accepted a wire deadline beyond the five-second limit")
 	}
 }

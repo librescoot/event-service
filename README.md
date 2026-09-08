@@ -93,7 +93,8 @@ lsc ext tail 'alarm.*'
 
 Management goes through `extensions:rpc` to event-service. `lsc --redis-addr`
 selects the remote service's datastore; the CLI never edits its own local
-rule directory. `--json` supports automation, and `tail --json` emits one event
+rule directory. RPC deadlines use Redis's clock, so the CLI and service do not
+need synchronized wall clocks. `--json` supports automation, and `tail --json` emits one event
 per line. `status` queries the running service, not potentially stale counters.
 
 **Mutations require an explicit service restart on the MDB.** They report
