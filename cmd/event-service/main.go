@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"log"
@@ -10,9 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/librescoot/event-service/api"
 	"github.com/librescoot/event-service/internal/action"
 	"github.com/librescoot/event-service/internal/adapter"
 	"github.com/librescoot/event-service/internal/canbus"
+	"github.com/librescoot/event-service/internal/control"
 	"github.com/librescoot/event-service/internal/engine"
 	"github.com/librescoot/event-service/internal/rules"
 	"github.com/librescoot/event-service/internal/sched"
@@ -26,8 +29,8 @@ import (
 var version = "dev"
 
 // defaultStatsInterval is how often the counters in the extensions hash are
-// refreshed. Only fields whose value changed are written, so an idle rule set
-// costs one wakeup at this interval and no datastore traffic at all.
+// refreshed. Only fields whose value changed are written, so this stats loop
+// costs one wakeup at this interval and no writes for an idle rule set.
 const defaultStatsInterval = 10 * time.Second
 
 // logger is the small slice of logging this file needs, the same interface
@@ -146,12 +149,13 @@ func main() {
 		log.Fatalf("adapter start: %v", err)
 	}
 
-	cfg, loadErrs := rules.Load(*rulesDir)
+	manager := control.New(*rulesDir, func() rules.StateFunc { return sh.Snapshot() })
+	cfg, loadErrs := manager.RuntimeConfig()
 	for _, err := range loadErrs {
 		log.Printf("rules: %v", err)
 	}
 
-	compiled, compileErrs := rules.Compile(cfg.Rules, sh.Get)
+	compiled, compileErrs := rules.CompileForRuntime(cfg, sh.Get)
 	for _, err := range compileErrs {
 		log.Printf("rules: %v", err)
 	}
@@ -198,6 +202,23 @@ func main() {
 		return func() { _ = psub.Close() }
 	}, log.Default())
 
+	manager.SetRuntime(en.RuleInfo, func() api.StatusResponse {
+		return api.StatusResponse{
+			Version: version, APIVersion: api.ProtocolVersion,
+			QueueDepth: pool.QueueDepth(), QueueCapacity: pool.QueueCapacity(),
+			Workers: pool.Workers(), BusyWorkers: pool.BusyWorkers(),
+			Counters: buildSnapshot(pool, sch, en, version, canSender.Stats()),
+		}
+	})
+	managementCtx, stopManagement := context.WithCancel(client.Context())
+	managementDone := make(chan struct{})
+	go func() {
+		defer close(managementDone)
+		if err := api.Serve(managementCtx, client.Raw(), manager.Handle); err != nil && managementCtx.Err() == nil {
+			log.Printf("extension management: %v", err)
+		}
+	}()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
@@ -218,6 +239,8 @@ func main() {
 	// Stats goes after all of that, so the last snapshot it may be writing
 	// reports counters that have stopped moving. The adapter and the client go
 	// last, because everything above writes through them.
+	stopManagement()
+	<-managementDone
 	stopSub()
 	en.Stop()
 	sch.Stop()

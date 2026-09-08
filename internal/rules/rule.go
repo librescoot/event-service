@@ -47,6 +47,7 @@ type Rule struct {
 	Repeat      *Repeat
 	Debounce    time.Duration
 	Steps       []Step
+	ReplayOnly  bool
 
 	program *vm.Program
 	state   StateFunc
@@ -111,6 +112,34 @@ func Compile(cfgs []RuleConfig, lookup StateFunc) ([]*Rule, []error) {
 		// Claimed only once the rule really loaded, so a name a broken rule
 		// mentioned is still free for a working one.
 		source[c.Name] = c.Source
+		out = append(out, r)
+	}
+	return out, errs
+}
+
+// CompileForRuntime retains unambiguous disabled definitions only for pending
+// replay. Disabling blocks future triggers, not cleanup from a previous run.
+func CompileForRuntime(cfgs []RuleConfig, lookup StateFunc) ([]*Rule, []error) {
+	out, errs := Compile(cfgs, lookup)
+	counts := make(map[string]int)
+	for _, c := range cfgs {
+		counts[c.Name]++
+	}
+	for _, c := range cfgs {
+		if c.Enabled == nil || *c.Enabled {
+			continue
+		}
+		if counts[c.Name] != 1 {
+			errs = append(errs, fmt.Errorf("disabled rule %q in %s: ambiguous name, pending steps cannot replay", c.Name, c.Source))
+			continue
+		}
+		r, err := ValidateDefinition(c, lookup)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("disabled rule %q in %s: %w", c.Name, c.Source, err))
+			continue
+		}
+		r.ReplayOnly = true
+		r.CancelOn = nil
 		out = append(out, r)
 	}
 	return out, errs

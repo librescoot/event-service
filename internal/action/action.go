@@ -74,6 +74,7 @@ type Pool struct {
 	dispatched atomic.Uint64
 	dropped    atomic.Uint64
 	failed     atomic.Uint64
+	busy       atomic.Int64
 
 	stopOnce sync.Once
 }
@@ -128,6 +129,7 @@ func (p *Pool) run() {
 
 		select {
 		case j := <-p.jobs:
+			p.busy.Add(1)
 			p.dispatched.Add(1)
 			err := j.action.Do(p.runCtx, j.event)
 			if err != nil {
@@ -141,6 +143,7 @@ func (p *Pool) run() {
 			if j.done != nil {
 				j.done(err)
 			}
+			p.busy.Add(-1)
 		case <-p.done:
 			return
 		}
@@ -213,6 +216,11 @@ func (p *Pool) Stop() {
 	}
 }
 
+func (p *Pool) QueueDepth() int    { return len(p.jobs) }
+func (p *Pool) QueueCapacity() int { return cap(p.jobs) }
+func (p *Pool) Workers() int       { return p.workers }
+func (p *Pool) BusyWorkers() int   { return int(p.busy.Load()) }
+
 // Stats returns a snapshot of the counters.
 func (p *Pool) Stats() Stats {
 	return Stats{
@@ -250,6 +258,9 @@ func WithCAN(sender CANSender) BuildOption {
 
 // Build turns a step spec into a runnable action.
 func Build(s Spec, c Pusher, options ...BuildOption) (Action, error) {
+	if err := Validate(s); err != nil {
+		return nil, err
+	}
 	var opts buildOptions
 	for _, option := range options {
 		option(&opts)

@@ -74,10 +74,54 @@ redis-cli HGETALL extensions
 ```
 
 Files are loaded non-recursively, in filename order, from lowercase `*.toml`
-files. There is no hot reload, SIGHUP reload, or validation-only CLI; restart
-for changes to take effect. Invalid files/rules are logged and skipped while
-valid rules can still run, so check the logs and loaded-rule count, not just
-whether the unit is active. `lsc ext` is not implemented yet.
+files. There is no hot reload or SIGHUP reload; restart for changes to take
+effect. Invalid files/rules are logged and skipped while valid rules can still
+run, so check the logs and loaded-rule count, not just whether the unit is active.
+
+### Managing rules with lsc
+
+```sh
+lsc ext add demo --on alarm.triggered --do redis --list test:fired --push yes
+lsc ext list
+lsc ext show demo
+lsc ext test demo --event '{"topic":"alarm.triggered","to":"level-2-triggered"}'
+lsc ext disable demo
+lsc ext enable demo
+lsc ext status
+lsc ext tail 'alarm.*'
+```
+
+Management goes through `extensions:rpc` to event-service. `lsc --redis-addr`
+selects the remote service's datastore; the CLI never edits its own local
+rule directory. `--json` supports automation, and `tail --json` emits one event
+per line. `status` queries the running service, not potentially stale counters.
+
+**Mutations require an explicit service restart on the MDB.** They report
+pending restart and do not change active subscriptions or runs. Until that
+restart, existing rules can still accept new triggers. After restarting,
+disabled rules accept no new triggers, but valid recorded delayed tails are
+allowed to finish (without `cancel-on` cancellation). Replay expiry and
+fingerprint checks still apply; repeat gaps and queued triggers are not saved.
+
+`add` writes a dedicated managed TOML file. Enable/disable preferences are
+stored in `.enabled.json` and take precedence over TOML `enabled` fields;
+hand-authored files are not rewritten. Revision checks reject conflicting
+updates. If a request times out, use `show` or `list` to reconcile before
+retrying: a file may have been saved even if its reply was lost.
+
+The catalogue is bounded to 128 directory entries, 64 KiB per configuration
+file, 1 MiB total, 512 rules, and 128 steps per rule. Configuration files and
+the directory must not be symlinks. Unreadable or invalid `.enabled.json`
+blocks runtime activation rather than silently re-enabling rules. Protect
+Redis access: this is a trusted administrative interface, not an execution
+sandbox. Management keeps one blocking request reader even with zero rules;
+it does not poll configuration files or add idle counter writes.
+
+`test` is always a dry run: it does not publish the supplied event, execute
+an action, open CAN sockets, create timers, or modify runtime counters. It
+checks the desired definition against a snapshot of current shadow state,
+including disabled rules. Delayed conditions are not predictions of future
+state; cooldown, debounce, and concurrency are not simulated.
 
 ## Observing the bus
 

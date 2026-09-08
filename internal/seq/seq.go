@@ -49,18 +49,7 @@ func Build(r *rules.Rule, c action.Pusher, options ...action.BuildOption) (*Sequ
 	s := &Sequence{Rule: r, Steps: make([]CompiledStep, 0, len(r.Steps))}
 
 	for i, step := range r.Steps {
-		a, err := action.Build(action.Spec{
-			Do:      step.Config.Do,
-			List:    step.Config.List,
-			Push:    step.Config.Push,
-			Command: step.Config.Command,
-			Timeout: step.Config.Timeout,
-			Iface:   step.Config.Iface,
-			ID:      step.Config.ID,
-			Data:    step.Config.Data,
-			RTR:     step.Config.RTR,
-			DLC:     step.Config.DLC,
-		}, c, options...)
+		a, err := action.Build(step.Config.ActionSpec(), c, options...)
 		if err != nil {
 			return nil, fmt.Errorf("step %d: %w", i, err)
 		}

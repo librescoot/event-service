@@ -55,6 +55,22 @@ func (s *Store) Get(hash, field string) string {
 	return s.hashes[hash][field]
 }
 
+// Snapshot returns an immutable lookup for a dry run, so multiple conditions
+// cannot observe different revisions while the adapter receives updates.
+func (s *Store) Snapshot() func(string, string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	values := make(map[string]map[string]string, len(s.hashes))
+	for hash, fields := range s.hashes {
+		copyFields := make(map[string]string, len(fields))
+		for field, value := range fields {
+			copyFields[field] = value
+		}
+		values[hash] = copyFields
+	}
+	return func(hash, field string) string { return values[hash][field] }
+}
+
 // Seed installs current values without reporting them as changes. The adapter
 // calls this at startup after HGETALL so that the first real notification
 // produces a correct "from" instead of an empty one.

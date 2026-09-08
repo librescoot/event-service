@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/librescoot/event-service/api"
 	"github.com/librescoot/event-service/internal/action"
 	"github.com/librescoot/event-service/internal/rules"
 	"github.com/librescoot/event-service/internal/sched"
@@ -35,10 +36,11 @@ type bound struct {
 
 // Engine holds the compiled rules and their built sequences.
 type Engine struct {
-	bounds []*bound
-	runner *seq.Runner
-	sch    *sched.Scheduler
-	log    Logger
+	bounds    []*bound
+	sequences []*seq.Sequence
+	runner    *seq.Runner
+	sch       *sched.Scheduler
+	log       Logger
 }
 
 // New builds a sequence for every rule. A rule whose steps cannot be built is
@@ -57,7 +59,10 @@ func New(rs []*rules.Rule, pool *action.Pool, sch *sched.Scheduler, store *seq.P
 			errs = append(errs, fmt.Errorf("rule %q in %s: %w", r.Name, r.Source, err))
 			continue
 		}
-		en.bounds = append(en.bounds, &bound{rule: r, seq: s})
+		en.sequences = append(en.sequences, s)
+		if !r.ReplayOnly {
+			en.bounds = append(en.bounds, &bound{rule: r, seq: s})
+		}
 	}
 	return en, errs
 }
@@ -69,6 +74,20 @@ func (en *Engine) RuleCount() int { return len(en.bounds) }
 // now, forwarded from the runner.
 func (en *Engine) Active() int { return en.runner.Active() }
 
+// RuleInfo is a read-only runtime view; desired configuration is managed
+// separately and may differ until the service restarts.
+func (en *Engine) RuleInfo(name string) api.RuleSummary {
+	metric := en.runner.RuleStats(name)
+	out := api.RuleSummary{Name: name, LastFire: metric.LastFire, Errors: metric.Errors, ActiveRuns: metric.Active}
+	for _, b := range en.bounds {
+		if b.rule.Name == name {
+			out.Loaded = true
+			break
+		}
+	}
+	return out
+}
+
 // Refused is how many triggers a queue-policy rule has turned away since
 // start because its backlog was full, forwarded from the runner.
 func (en *Engine) Refused() uint64 { return en.runner.Refused() }
@@ -78,11 +97,7 @@ func (en *Engine) Refused() uint64 { return en.runner.Refused() }
 // so a resumed step cannot race a live re-fire of the same rule; a record
 // more than window past due is dropped rather than run.
 func (en *Engine) Replay(window time.Duration) int {
-	seqs := make([]*seq.Sequence, 0, len(en.bounds))
-	for _, b := range en.bounds {
-		seqs = append(seqs, b.seq)
-	}
-	return en.runner.Replay(seqs, window)
+	return en.runner.Replay(en.sequences, window)
 }
 
 // Patterns returns the PSUBSCRIBE patterns needed to see every topic any rule
@@ -132,6 +147,7 @@ func (en *Engine) Handle(e eventbus.Event) {
 	for _, b := range en.bounds {
 		ok, err := b.rule.Matches(e)
 		if err != nil {
+			en.runner.RecordError(b.rule.Name)
 			en.log.Printf("rule %s: %v", b.rule.Name, err)
 			continue
 		}

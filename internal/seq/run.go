@@ -88,6 +88,7 @@ type Runner struct {
 
 	mu      sync.Mutex
 	runs    map[string][]*run
+	metrics map[string]RuleStats
 	queued  map[string][]queuedFire
 	nextRun uint64
 	refused uint64
@@ -100,13 +101,14 @@ type Runner struct {
 // keeps everything in memory.
 func NewRunner(pool *action.Pool, sch *sched.Scheduler, store *PendingStore, log Logger) *Runner {
 	return &Runner{
-		pool:   pool,
-		sch:    sch,
-		store:  store,
-		log:    log,
-		epoch:  time.Now().UnixNano(),
-		runs:   make(map[string][]*run),
-		queued: make(map[string][]queuedFire),
+		pool:    pool,
+		sch:     sch,
+		store:   store,
+		log:     log,
+		epoch:   time.Now().UnixNano(),
+		runs:    make(map[string][]*run),
+		metrics: make(map[string]RuleStats),
+		queued:  make(map[string][]queuedFire),
 	}
 }
 
@@ -121,6 +123,9 @@ func (rn *Runner) newRunLocked(s *Sequence, e eventbus.Event) *run {
 		id:    fmt.Sprintf("%s#%d-%d", name, rn.epoch, rn.nextRun),
 	}
 	rn.runs[name] = append(rn.runs[name], r)
+	metric := rn.metrics[name]
+	metric.LastFire = time.Now().UnixMilli()
+	rn.metrics[name] = metric
 	return r
 }
 
@@ -473,6 +478,7 @@ func (rn *Runner) runStep(r *run, idx int, step CompiledStep) {
 	if step.When != nil {
 		ok, err := r.seq.Rule.EvalWhen(step.When, r.event)
 		if err != nil {
+			rn.RecordError(name)
 			rn.log.Printf("rule %s: step %d: %v", name, idx, err)
 			rn.end(r)
 			return
@@ -516,6 +522,7 @@ func (rn *Runner) runStep(r *run, idx int, step CompiledStep) {
 			// would run "turn the hazards off" against a state the earlier
 			// step never established. The pool has already logged and counted
 			// the action's own error; this line says what it cost.
+			rn.RecordError(name)
 			if step.Action.Kind() != "can" {
 				rn.log.Printf("rule %s: step %d failed, %d later step(s) skipped", name, idx, len(r.seq.Steps)-idx-1)
 			}
@@ -830,6 +837,9 @@ func (rn *Runner) resume(s *Sequence, p Pending, remaining time.Duration) (start
 		}
 	}
 	rn.runs[name] = append(rn.runs[name], r)
+	metric := rn.metrics[name]
+	metric.LastFire = time.Now().UnixMilli()
+	rn.metrics[name] = metric
 	rn.mu.Unlock()
 
 	// The replaced runs' records go once the lock is down, for the same reason
