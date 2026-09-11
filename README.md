@@ -1,7 +1,9 @@
-# event-service
+# Librescoot Event Service
 
 Turns Librescoot system state changes into a normalised event bus, and runs
 user-defined rules against it.
+
+Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
 The service runs on the MDB. It is being integrated into nightly images ahead
 of Librescoot 1.4.0; it is not included in 1.3.1 stable images. No automation
@@ -463,4 +465,6 @@ something that happened before the current rider ever saw the vehicle.
 
 ## License
 
-[GNU AGPL-3.0](LICENSE).
+This project is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+Made with ❤️ by the Librescoot community
