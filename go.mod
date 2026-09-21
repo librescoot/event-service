@@ -7,7 +7,7 @@ require (
 	github.com/brutella/can v0.0.2
 	github.com/expr-lang/expr v1.17.8
 	github.com/librescoot/eventbus v0.1.0
-	github.com/librescoot/redis-ipc v0.15.2
+	github.com/librescoot/redis-ipc v0.15.3
 	github.com/redis/go-redis/v9 v9.18.0
 	golang.org/x/sys v0.30.0
 )
