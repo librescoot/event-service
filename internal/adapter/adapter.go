@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"github.com/librescoot/event-service/internal/shadow"
 	"github.com/librescoot/eventbus"
@@ -23,6 +24,8 @@ type Adapter struct {
 	shadow   *shadow.Store
 	sources  []Source
 	watchers []*ipc.HashWatcher
+	selected []*selectedHashWatcher
+	stopping atomic.Bool
 	subs     []*ipc.Subscription[string]
 
 	// seeding marks, per hash, whether the initial HGETALL replay done by
@@ -43,6 +46,53 @@ func New(client *ipc.Client, em Emitter, sh *shadow.Store) *Adapter {
 // Register adds a source. Call before Start.
 func (a *Adapter) Register(s Source) {
 	a.sources = append(a.sources, s)
+}
+
+// CanRegister checks notification-kind conflicts without changing subscriptions.
+func (a *Adapter) CanRegister(s Source) error {
+	hashes := make(map[string]bool)
+	channels := make(map[string]bool)
+	for _, source := range a.sources {
+		for _, h := range source.Hashes() {
+			hashes[h] = true
+		}
+		for _, c := range source.Channels() {
+			channels[c] = true
+		}
+	}
+	for _, h := range s.Hashes() {
+		hashes[h] = true
+	}
+	for _, c := range s.Channels() {
+		channels[c] = true
+	}
+	for h := range hashes {
+		if channels[h] {
+			return fmt.Errorf("adapter: %q is registered as both a hash and a channel", h)
+		}
+	}
+	return nil
+}
+
+// selectedFields returns nil if any source requires the legacy whole-hash
+// view. Generic-only hashes use explicit, bounded field reads instead.
+func (a *Adapter) selectedFields(hash string) map[string]int {
+	fields := make(map[string]int)
+	for _, s := range a.sources {
+		if !contains(s.Hashes(), hash) {
+			continue
+		}
+		selector, ok := s.(interface{ FieldLimits(string) map[string]int })
+		if !ok {
+			return nil
+		}
+		for field, limit := range selector.FieldLimits(hash) {
+			if limit > fields[field] {
+				fields[field] = limit
+			}
+		}
+	}
+	return fields
 }
 
 // Subscriptions returns every hash and channel the registered sources need,
@@ -77,7 +127,12 @@ func (a *Adapter) Subscriptions() []string {
 // that was already there before the process started is not a transition.
 // Only fields observed after StartWithSync returns are live and get
 // dispatched to sources, with "from" taken from the seeded value.
-func (a *Adapter) Start() error {
+func (a *Adapter) Start() (err error) {
+	defer func() {
+		if err != nil {
+			a.Stop()
+		}
+	}()
 	hashes := make(map[string]bool)
 	channels := make(map[string]bool)
 	for _, s := range a.sources {
@@ -97,6 +152,23 @@ func (a *Adapter) Start() error {
 
 	for h := range hashes {
 		hash := h
+		if fields := a.selectedFields(hash); fields != nil {
+			w := newSelectedHashWatcher(a.client.Raw(), hash, fields,
+				func(field, value string) { a.dispatchField(hash, field, value) },
+				func(field string) { a.shadow.Observe(hash, field, "") })
+			w.onSnapshot = func(values map[string]string, invalid []string) {
+				a.dispatchSnapshot(hash, values, invalid)
+			}
+			a.setSeeding(hash, true)
+			err := w.Start(a.client.Context())
+			a.setSeeding(hash, false)
+			if err != nil {
+				return fmt.Errorf("watch selected fields of %s: %w", hash, err)
+			}
+			a.selected = append(a.selected, w)
+			w.Activate()
+			continue
+		}
 		w := a.client.NewHashWatcher(hash)
 		w.OnAny(func(field, value string) error {
 			a.dispatchField(hash, field, value)
@@ -130,6 +202,10 @@ func (a *Adapter) Start() error {
 // Stop releases every watcher and subscription. Errors are not actionable
 // during shutdown, so they are discarded rather than surfaced.
 func (a *Adapter) Stop() {
+	a.stopping.Store(true)
+	for _, w := range a.selected {
+		_ = w.Stop()
+	}
 	for _, w := range a.watchers {
 		_ = w.Stop()
 	}
@@ -170,6 +246,20 @@ func (a *Adapter) dispatchField(hash, field, value string) {
 	}
 }
 
+func (a *Adapter) dispatchSnapshot(hash string, values map[string]string, invalid []string) {
+	changes := a.shadow.ObserveBatch(hash, values, invalid)
+	if a.isSeeding(hash) {
+		return
+	}
+	for _, change := range changes {
+		for _, source := range a.sources {
+			if contains(source.Hashes(), hash) {
+				a.emit(a.callOnField(source, hash, change.Field, change.To, change.From))
+			}
+		}
+	}
+}
+
 func (a *Adapter) dispatchMessage(channel, payload string) {
 	for _, s := range a.sources {
 		if !contains(s.Channels(), channel) {
@@ -207,6 +297,9 @@ func (a *Adapter) callOnMessage(s Source, channel, payload string) (evs []eventb
 // the others or kill the watcher goroutine, so errors are logged and skipped.
 func (a *Adapter) emit(evs []eventbus.Event) {
 	for _, e := range evs {
+		if a.stopping.Load() {
+			return
+		}
 		if err := a.emitter.Emit(e); err != nil {
 			log.Printf("emit %s: %v", e.Topic, err)
 		}

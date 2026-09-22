@@ -9,6 +9,7 @@ import (
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
+	"github.com/librescoot/event-service/internal/inputs"
 	"github.com/librescoot/eventbus"
 )
 
@@ -38,6 +39,7 @@ const (
 // load, so matching is a VM run over a small map with no allocation-heavy
 // reflection and no I/O.
 type Rule struct {
+	Inputs      []inputs.Config
 	Name        string
 	Source      string
 	On          []string
@@ -146,6 +148,12 @@ func CompileForRuntime(cfgs []RuleConfig, lookup StateFunc) ([]*Rule, []error) {
 }
 
 func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
+	if len(c.Inputs) > inputs.MaxPerRule {
+		return nil, fmt.Errorf("at most %d inputs per rule", inputs.MaxPerRule)
+	}
+	if err := inputs.ValidateSet(c.Inputs); err != nil {
+		return nil, err
+	}
 	if c.Name == "" {
 		return nil, fmt.Errorf("missing name")
 	}
@@ -161,6 +169,7 @@ func compileOne(c RuleConfig, lookup StateFunc) (*Rule, error) {
 	}
 
 	r := &Rule{
+		Inputs:      inputs.Clone(c.Inputs),
 		Name:        c.Name,
 		Source:      c.Source,
 		On:          c.On,

@@ -152,6 +152,51 @@ func TestVehicleFirstObservationEmitsNothing(t *testing.T) {
 	}
 }
 
+func TestVehicleEnginePowerTransitions(t *testing.T) {
+	values := []struct {
+		name, value string
+	}{
+		{"on", "on"},
+		{"off", "off"},
+		{"empty", ""},
+		{"unknown", "unknown"},
+		{"uppercase-on", "ON"},
+		{"uppercase-off", "OFF"},
+		{"padded-on", " on "},
+		{"padded-off", " off "},
+		{"numeric-on", "1"},
+		{"numeric-off", "0"},
+	}
+	for _, from := range values {
+		for _, to := range values {
+			t.Run(from.name+"-to-"+to.name, func(t *testing.T) {
+				got := NewVehicleSource().OnField("vehicle", "engine-power", to.value, from.value)
+				wantEvent := (from.value == "on" && to.value == "off") ||
+					(from.value == "off" && to.value == "on")
+				if !wantEvent {
+					if len(got) != 0 {
+						t.Fatalf("got %v, want no event", topics(got))
+					}
+					return
+				}
+				if len(got) != 1 {
+					t.Fatalf("got %v, want exactly one event", topics(got))
+				}
+				e := got[0]
+				if e.Topic != "vehicle.engine-power.changed" {
+					t.Errorf("Topic = %q, want vehicle.engine-power.changed", e.Topic)
+				}
+				if e.From != from.value || e.To != to.value {
+					t.Errorf("from/to = %q/%q, want %q/%q", e.From, e.To, from.value, to.value)
+				}
+				if e.Src != "adapter" {
+					t.Errorf("Src = %q, want adapter", e.Src)
+				}
+			})
+		}
+	}
+}
+
 func TestVehicleSeatboxAndKickstand(t *testing.T) {
 	v := NewVehicleSource()
 	cases := []struct {

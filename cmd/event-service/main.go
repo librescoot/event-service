@@ -144,11 +144,6 @@ func main() {
 	ad.Register(adapter.NewBatterySource())
 	ad.Register(adapter.NewMiscSource(adapter.NewLiveLookup(client)))
 
-	log.Printf("subscribing to: %v", ad.Subscriptions())
-	if err := ad.Start(); err != nil {
-		log.Fatalf("adapter start: %v", err)
-	}
-
 	manager := control.New(*rulesDir, func() rules.StateFunc { return sh.Snapshot() })
 	cfg, loadErrs := manager.RuntimeConfig()
 	for _, err := range loadErrs {
@@ -158,6 +153,20 @@ func main() {
 	compiled, compileErrs := rules.CompileForRuntime(cfg, sh.Get)
 	for _, err := range compileErrs {
 		log.Printf("rules: %v", err)
+	}
+
+	compiled, configured, inputErrs := configureInputs(ad, compiled)
+	inputDiagnostics := make(map[string][]string)
+	for _, err := range inputErrs {
+		log.Printf("rules: %v", err)
+		if detail, ok := err.(*inputRuleError); ok {
+			inputDiagnostics[detail.name] = append(inputDiagnostics[detail.name], err.Error())
+		}
+	}
+	ad.Register(configured)
+	log.Printf("subscribing to: %v", ad.Subscriptions())
+	if err := ad.Start(); err != nil {
+		log.Fatalf("adapter start: %v", err)
 	}
 
 	sch := sched.New()
@@ -202,7 +211,11 @@ func main() {
 		return func() { _ = psub.Close() }
 	}, log.Default())
 
-	manager.SetRuntime(en.RuleInfo, func() api.StatusResponse {
+	manager.SetRuntime(func(name string) api.RuleSummary {
+		info := en.RuleInfo(name)
+		info.Diagnostics = append(info.Diagnostics, inputDiagnostics[name]...)
+		return info
+	}, func() api.StatusResponse {
 		return api.StatusResponse{
 			Version: version, APIVersion: api.ProtocolVersion,
 			QueueDepth: pool.QueueDepth(), QueueCapacity: pool.QueueCapacity(),

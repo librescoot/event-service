@@ -11,7 +11,10 @@
 // incoming notifications carry no news.
 package shadow
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // Store is safe for concurrent use. The adapter reads it from rule-guard
 // evaluation while the watcher goroutine writes it.
@@ -46,6 +49,41 @@ func (s *Store) Observe(hash, field, value string) (prev string, changed bool) {
 	}
 	fields[field] = value
 	return prev, true
+}
+
+// Change is one observed field change in a batch.
+type Change struct {
+	Field, From, To string
+}
+
+// ObserveBatch installs an atomic selected-field snapshot before returning any
+// changes to publish. Invalid oversized values are cleared without fake events.
+func (s *Store) ObserveBatch(hash string, values map[string]string, invalid []string) []Change {
+	keys := make([]string, 0, len(values))
+	for field := range values {
+		keys = append(keys, field)
+	}
+	sort.Strings(keys)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fields := s.hashes[hash]
+	if fields == nil {
+		fields = make(map[string]string)
+		s.hashes[hash] = fields
+	}
+	for _, field := range invalid {
+		fields[field] = ""
+	}
+	var changes []Change
+	for _, field := range keys {
+		value := values[field]
+		previous, existed := fields[field]
+		fields[field] = value
+		if !existed || previous != value {
+			changes = append(changes, Change{Field: field, From: previous, To: value})
+		}
+	}
+	return changes
 }
 
 // Get returns the last observed value, or empty if the field is unknown.

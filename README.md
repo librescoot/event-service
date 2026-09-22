@@ -145,6 +145,30 @@ is down or disconnected are not replayed. The adapter observes notified hash
 values rather than atomic producer transitions; rapid intermediate values can
 be missed. It does not provide an authoritative vehicle transition log.
 
+### Engine power changes
+
+`vehicle.engine-power.changed` reports observed changes to `vehicle[engine-power]`
+with `src = "adapter"` and `from`/`to` equal to `"off"`/`"on"` or `"on"`/`"off"`.
+Only transitions between these two known values emit an event. Initial
+observations, empty or invalid values on either side, and unchanged values
+emit nothing.
+
+This field represents commanded engine-power GPIO changes, not measured ECU
+supply voltage or ECU boot state. The event does **not** detect an uncommanded
+ECU reset while engine power remains commanded on. As with other adapter
+events, rapid intermediate changes can be missed. To trigger only on commanded
+power-on, match `vehicle.engine-power.changed` with `when = "to == 'on'"`.
+
+## Configurable inputs
+
+Rules can opt into arbitrary notified hash fields and exact raw pub/sub channels
+with `[[rule.input]]`, including string/JSON payloads and state-only dependencies
+for `state()`. No source-code handler is needed per field. Inputs activate only
+after restart and never consume command or RPC queues.
+
+See [Configurable inputs](docs/inputs.md) for examples, limits, and the boundaries
+of notification-based observation.
+
 ## Rules
 
 Drop `*.toml` files into the extensions directory (`--rules-dir`, default

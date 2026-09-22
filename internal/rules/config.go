@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/librescoot/event-service/internal/inputs"
 )
 
 // Config is the merged content of every file in the extensions directory.
@@ -20,15 +21,16 @@ type Config struct {
 // RuleConfig is one [[rule]] block as written on disk. It is the wire format,
 // not the runtime shape: Compile turns it into a Rule.
 type RuleConfig struct {
-	Name        string        `toml:"name"`
-	On          []string      `toml:"on"`
-	When        string        `toml:"when"`
-	Cooldown    string        `toml:"cooldown"`
-	Enabled     *bool         `toml:"enabled"`
-	Steps       []StepConfig  `toml:"step"`
-	Concurrency string        `toml:"concurrency"`
-	CancelOn    []string      `toml:"cancel-on"`
-	Repeat      *RepeatConfig `toml:"repeat"`
+	Inputs      []inputs.Config `toml:"input"`
+	Name        string          `toml:"name"`
+	On          []string        `toml:"on"`
+	When        string          `toml:"when"`
+	Cooldown    string          `toml:"cooldown"`
+	Enabled     *bool           `toml:"enabled"`
+	Steps       []StepConfig    `toml:"step"`
+	Concurrency string          `toml:"concurrency"`
+	CancelOn    []string        `toml:"cancel-on"`
+	Repeat      *RepeatConfig   `toml:"repeat"`
 
 	// Debounce is a pointer because a duration has no nil of its own, and
 	// Compile has to tell "debounce was never written" from "debounce was

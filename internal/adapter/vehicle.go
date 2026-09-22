@@ -21,6 +21,8 @@ const (
 	stateParked       = "parked"
 	stateReadyToDrive = "ready-to-drive"
 
+	topicEnginePowerChanged = "vehicle.engine-power.changed"
+
 	// hibernationPrefix matches waiting-hibernation and its -advanced,
 	// -seatbox and -confirm variants.
 	hibernationPrefix = "waiting-hibernation"
@@ -46,6 +48,13 @@ func (v *VehicleSource) OnField(hash, field, value, prev string) []eventbus.Even
 	switch field {
 	case "state":
 		return v.stateChange(value, prev)
+	case "engine-power":
+		// This is the commanded GPIO state, not measured ECU supply or boot
+		// state. Unknown initial values must not fabricate power transitions.
+		if (prev != "on" && prev != "off") || (value != "on" && value != "off") || prev == value {
+			return nil
+		}
+		return one(topicEnginePowerChanged, prev, value)
 	case "seatbox:lock":
 		if prev == "" {
 			return nil
