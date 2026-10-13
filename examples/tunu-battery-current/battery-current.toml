@@ -1,0 +1,23 @@
+[[rule]]
+name = "tunu-battery-current"
+on = ["battery.state.changed", "battery.inserted", "battery.removed"]
+concurrency = "queue"
+
+  [[rule.step]]
+  do = "exec"
+  command = "/data/extensions/battery-current.py"
+  timeout = "15s"
+
+[[rule]]
+name = "tunu-battery-current-power-on"
+on = ["vehicle.engine-power.changed"]
+when = "to == 'on'"
+concurrency = "queue"
+repeat = { count = 3, every = "2s" }
+
+  [[rule.step]]
+  after = "2s"
+  durable = false
+  do = "exec"
+  command = "/data/extensions/battery-current.py"
+  timeout = "15s"
